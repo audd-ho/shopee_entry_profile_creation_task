@@ -99,22 +99,24 @@ Two options considered:
 **(A) Delete-on-write (cache-aside invalidation):**
 ```
 UPDATE users SET nickname = ? WHERE id = ?
-DEL user:<user_id>
+DEL user:<username>
+DEL profile:<user_id>
 ```
 Next reader misses cache, refetches from DB, populates cache.
 
 **(B) Write-through:**
 ```
 UPDATE users SET nickname = ? WHERE id = ?
-SET user:<user_id> <new record>
+SET user:<username> <new full record>
+SET profile:<user_id> <new profile>
 ```
 Cache always fresh; readers hit cache immediately.
 
 **Race analysis:** write-through has a subtle bug with concurrent writers:
 ```
 T=1: A: UPDATE nickname = "Alice"       T=2: B: UPDATE nickname = "Alicia"
-T=3: B: SET user:42 {nickname: "Alicia"}
-T=4: A: SET user:42 {nickname: "Alice"}   ← overwrites with older data
+T=3: B: SET user:alice {nickname: "Alicia"}
+T=4: A: SET user:alice {nickname: "Alice"}   ← overwrites with older data
 Result: DB = "Alicia", Cache = "Alice"  (divergent until TTL)
 ```
 Delete-on-write is race-safe (deleting is idempotent; next read refetches fresh).
@@ -125,21 +127,19 @@ Delete-on-write is race-safe (deleting is idempotent; next read refetches fresh)
 - One extra DB read on next access — acceptable trade
 - Consistent with "cache-aside" pattern from top of section
 
-**Invalidation triggers (with the split cache — see §5):**
+**Invalidation triggers:**
 
 | Action | Keys to invalidate |
 |---|---|
-| Nickname update | `user:<user_id>` |
-| Avatar update | `user:<user_id>` |
-| Signup | `creds:<username>` (only relevant if negative caching implemented) |
+| Nickname update | `user:<username>`, `profile:<user_id>` |
+| Avatar update | `user:<username>`, `profile:<user_id>` |
+| Signup | `user:<username>` (only relevant if negative caching implemented) |
 | Logout | `sess:<token>` |
-| Password change (future) | `creds:<username>` + all sessions for that user |
+| Password change (future) | `user:<username>` + all sessions for that user |
 
-**Note:** profile edits touch only `user:<user_id>`. `creds:<username>` is untouched because password didn't change — its cached hash is still valid. This keeps the login hot path warm across profile edits.
+**Negative caching note:** if we implement "user not found" negative caching, signup MUST invalidate that marker (`DEL user:<newuser>`), else login for a just-created user would incorrectly report not-found for the TTL window. Currently deferred; add if enumeration attacks become a concern.
 
-**Negative caching note:** if we implement "user not found" negative caching, signup MUST invalidate that marker (`DEL creds:<newuser>`), else login for a just-created user would incorrectly report not-found for the TTL window. Currently deferred; add if enumeration attacks become a concern.
-
-**Status: TBD** on remaining sub-decisions (TTLs, negative caching).
+**Status: TBD** on remaining sub-decisions (what to cache, TTLs, negative caching).
 
 ---
 
@@ -660,7 +660,7 @@ Re-reading the task: *"Connect by MySQL Go client. **Connection Pool should be b
 At 6k+ RPS, batching multiple Redis commands per round trip is a real win. Example login flow:
 ```
 Login handler needs:
-  1. GET creds:<username>     (credentials cache lookup)
+  1. GET user:<username>      (cache lookup)
   2. INCR rl:login:ip:<ip>    (rate limit counter)
   3. SETEX sess:<token>       (create session)
 ```
@@ -920,67 +920,36 @@ CREATE TABLE users (
 | Key | Value | TTL |
 |---|---|---|
 | `sess:<token>` | JSON `{user_id, username, created_at, ip?, last_seen}` | 24h sliding |
-| `creds:<username>` | JSON `{id, password_hash}` | 10 min |
-| `user:<user_id>` | JSON `{nickname, avatar_version, avatar_suffix}` | 1 h |
+| `user:<username>` | JSON `{id, password_hash, nickname, avatar_version, avatar_suffix}` | 10 min |
+| `profile:<user_id>` | JSON `{nickname, avatar_version, avatar_suffix}` | 1 h |
 | `rl:login:ip:<ip>` | counter | 5 min |
 | `rl:login:user:<uname>` | counter | 15 min |
 
 **Cache-key design rationale:**
 
-- **Naming aligns with endpoint.** Each cache key prefix matches the endpoint that reads it:
-  - `POST /api/login` uses `creds:<username>` — credentials cache, indexed by the field the login request supplies (`username`)
-  - `GET /api/user` uses `user:<user_id>` — user-display cache, indexed by the field the authenticated request supplies (`user_id` from session)
-  - Reading the code / Redis dump, a reviewer can jump directly from endpoint → cache key.
-- **Not per-field caching.** Each cache key holds all the fields its endpoint needs — single GET per lookup, single JSON blob. Per-field GETs would multiply Redis ops for the same data.
-- **No field duplication.** With the minimal-login-response design (§6.1), login never returns profile fields → `creds:<username>` never needs `nickname` / `avatar_*`. Fields appear in exactly one cache key.
-- **Simpler invalidation.** Profile edits invalidate ONLY `user:<user_id>` — `creds:<username>` is untouched (password unchanged). Login's hot-path cache stays warm across profile edits.
-- **Different TTLs match volatility.** Credentials change rarely (password reset) → longer TTL is fine. Profile can change frequently (nickname edits) → shorter TTL bounds staleness on cache-hit-then-edit races.
-- **Different index keys naturally.** Login has only `username`; `/api/user` has only `user_id` (via session). Each cache is indexed by what the caller has, no cross-lookup needed.
+- **Not per-field caching.** Every hot-path read (login, `/api/me`) needs most fields together — per-field GETs would multiply Redis ops for the same data. Single JSON blob per logical access pattern is faster.
+- **Two keys per user, not one.** Splitting by access pattern:
+  - `user:<username>` — indexed by username for login (contains password_hash).
+  - `profile:<user_id>` — indexed by user_id for `/api/me` (no hash needed).
+- **Split benefits:**
+  - Different TTLs (password hash long-lived, profile shorter since edits are more frequent).
+  - Cleaner invalidation: profile edits invalidate only `profile:<user_id>`; login-critical `user:<username>` stays hot.
+  - Different index keys naturally — username lookup for login, id lookup for profile.
+- **`sess:<token>` and rate-limit keys** are separate concerns (session state, counters); no user data leaks in them.
 
 **Why session stores `username` alongside `user_id`:**
 
-The session record's job is to translate a token into an identity. Storing both `user_id` and `username` lets one Redis GET yield everything a downstream handler needs — no extra DB lookup to resolve username from user_id. Only ~20 extra bytes per session record. Also useful for potential future needs like displaying "Logged in as alice" without additional queries, or logging by username.
-
-**Note:** with the split cache design, we don't strictly *need* `username` in the session for invalidation anymore — profile edits touch only `user:<user_id>`. But keeping it costs almost nothing and simplifies future features that might reference the current user by name.
-
-**Split flow — login:**
+Every authenticated request must look up the session in Redis for auth (verify token exists, get identity). By storing **both** `user_id` and `username` in the session record, we get both identifiers in one Redis GET. This matters for cache invalidation on profile edits:
 
 ```
-POST /api/login {username, password}
-  1. Redis GET creds:<username>   →  {id, password_hash}   (or miss → DB → refill)
-  2. bcrypt.CompareHashAndPassword(hash, password)
-  3. Generate random session token
-  4. Redis SET sess:<token>                                (create session)
-Response: {success: true} + cookie
+Nickname update flow:
+  1. Redis GET sess:<token>  → {user_id: 42, username: "alice", ...}
+  2. MySQL UPDATE users SET nickname = ? WHERE id = 42
+  3. Redis DEL profile:42     (uses user_id from session)
+  4. Redis DEL user:alice     (uses username from session)
 ```
 
-Login touches only `creds:<username>` — never `user:<user_id>`. Fast, focused.
-
-**Split flow — /api/user:**
-
-```
-GET /api/user
-  1. Redis GET sess:<token>        →  {user_id, username, ...}
-  2. Redis GET user:<user_id>      →  {nickname, avatar_version, avatar_suffix}
-     (miss → DB → refill cache)
-  3. Compose avatar_url from user_id, version, suffix
-Response: {user_id, username, nickname, avatar_url}
-```
-
-The `/api/user` path never touches `creds:<username>` — no reason to fetch password hash on a display query.
-
-**Split flow — profile edit (nickname or avatar):**
-
-```
-POST /api/profile/nickname
-  1. Redis GET sess:<token>        →  {user_id, ...}
-  2. MySQL UPDATE users SET nickname = ? WHERE id = ?
-  3. Redis DEL user:<user_id>      (delete-on-write invalidation)
-     — creds:<username> untouched
-Response: {success: true}
-```
-
-Invalidation surface is exactly one key. The login hot path (`creds:<username>`) is undisturbed by profile edits.
+Without storing username in the session, step 4 would require an extra MySQL query to look up the username. The ~20 extra bytes per session record is negligible; the extra query is not. This is the session-record pulling **double duty** (auth check + identity retrieval for invalidation).
 
 ### User table: no vertical split
 
@@ -1001,54 +970,15 @@ Invalidation surface is exactly one key. The login hot path (`creds:<username>`)
 |---|---|---|---|
 | GET  | `/` | Landing (login/signup UI) | No |
 | POST | `/api/signup` | Create user | No |
-| POST | `/api/login` | Authenticate; sets cookie; returns `{success: true}` only | No |
+| POST | `/api/login` | Authenticate, set cookie | No |
 | POST | `/api/logout` | Destroy session | Yes |
-| GET  | `/api/user` | Current authenticated user's info | Yes |
+| GET  | `/api/me` | Current user info | Yes |
 | POST | `/api/profile/nickname` | Update nickname | Yes + CSRF |
 | POST | `/api/profile/avatar` | Upload avatar | Yes + CSRF |
 | GET  | `/uploads/<path>` | Serve avatar (public, unguessable filename via random suffix) | No |
-| GET  | `/default-avatar.svg` | Default avatar (static, shared) | No |
+| GET  | `/default.png` | Default avatar for users who haven't uploaded one (static, shared) | No |
 
-### 6.1 Login Response Design — Minimal vs Full
-
-**Options considered:**
-
-- **(A) Full user info on login response**
-  - Login returns `{token, user_id, username, nickname, avatar_url}` plus session cookie.
-  - Frontend has everything immediately, no follow-up call needed.
-- **(B) Minimal login response, separate `/api/user` for identity (chosen)**
-  - Login returns only `{success: true}` plus session cookie.
-  - Frontend always calls `/api/user` on protected pages to get identity/profile.
-
-**Trade-off analysis:**
-
-| Aspect | (A) Full-on-login | (B) Minimal + `/api/user` |
-|---|---|---|
-| Round trips (fresh login → profile) | 1 | 2 |
-| Round trips (returning user, cookie still valid) | 1 (`/api/user`) | 1 (`/api/user`) |
-| Client code paths | Two: "just logged in, use response" vs "cookie already valid, call `/api/user`" | One: always call `/api/user` |
-| Endpoint responsibility | Login also carries profile data | Login only authenticates; `/api/user` only returns identity |
-| Data freshness | Fresh at login; stale if user updates elsewhere | Always fresh (fetched on demand) |
-| Testability | Login response coupled to user schema | Each endpoint tested independently |
-
-**Decision: (B) Minimal login response.** Reasoning:
-
-- **Single-responsibility**: `POST /api/login` = "authenticate credentials, issue session." `GET /api/user` = "given this cookie, tell me who I am." Neither does double duty.
-- **Symmetric flow**: fresh login and returning-user-with-cookie both go through `/api/user` on the profile page. One client code path handles both cases.
-- **Freshness**: `/api/user` always fetches current state (cache or DB). No stale data from a login response held in JS.
-- **The `/api/user` path must exist anyway** — a user opening `/profile.html` with an existing valid cookie (returning next day) needs identity retrieval. Given that code path must exist, doing it on fresh login too is consistent, not wasteful.
-
-**Perf-test concern (weighed and dismissed):**
-- Task requires "3000/6000 login requests per second."
-- Load harness (`wrk`/`vegeta`) hits `POST /api/login` directly with N connections; it does NOT follow redirects or make browser-style follow-up calls unless explicitly scripted.
-- So the harness sends exactly 6k login requests/sec regardless of whether the app internally chases with `/api/user` on the client side. The perf test cost of the minimal-login design is **zero** from the harness's perspective.
-- The extra `/api/user` call happens only when a real browser interacts with the app — not during synthetic load tests.
-
-**Latency note (real browser flow):**
-- Fresh login → redirect to `/profile.html` → `/api/user` call adds ~1 round trip (~1-2ms local, ~50-150ms production).
-- Acceptable UX cost for the design clarity gained.
-
-**Status: ✅ locked-in.**
+**Note:** avatar URLs are publicly accessible but non-enumerable due to the random suffix in the filename. See §4.4.5 for rationale. The default avatar is a single shared static asset served when `avatar_version = 0`.
 
 ---
 

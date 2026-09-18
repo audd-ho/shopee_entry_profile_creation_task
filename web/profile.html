@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Profile</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="card">
+    <h1>Profile</h1>
+
+    <section id="view">
+      <img id="avatar" alt="avatar" src="" />
+      <p><strong>Username:</strong> <span id="username">-</span></p>
+      <p><strong>Nickname:</strong> <span id="nickname">-</span></p>
+      <button id="logout">Log out</button>
+    </section>
+
+    <hr />
+
+    <section>
+      <h2>Change nickname</h2>
+      <form id="nickname-form">
+        <label>
+          New nickname
+          <input type="text" name="nickname" required maxlength="32" />
+        </label>
+        <button type="submit">Save</button>
+      </form>
+    </section>
+
+    <section>
+      <h2>Change profile picture</h2>
+      <form id="avatar-form">
+        <label>
+          Choose an image (JPEG / PNG / WebP, up to 2 MB)
+          <input type="file" name="avatar" accept="image/jpeg,image/png,image/webp" required />
+        </label>
+        <button type="submit">Upload</button>
+      </form>
+    </section>
+
+    <p id="msg" class="msg"></p>
+  </main>
+
+  <script src="app.js"></script>
+  <script>
+    async function loadProfile() {
+      const msg = document.getElementById('msg');
+      try {
+        const res = await fetch('/api/me');
+        if (res.status === 401) {
+          window.location.href = 'login.html';
+          return;
+        }
+        if (!res.ok) throw new Error('load failed');
+        const data = await res.json();
+        document.getElementById('username').textContent = data.username || '-';
+        document.getElementById('nickname').textContent = data.nickname || '-';
+        const img = document.getElementById('avatar');
+        img.src = data.avatar_url || 'default-avatar.png';
+      } catch (err) {
+        msg.textContent = 'Could not load profile';
+        msg.className = 'msg err';
+      }
+    }
+
+    document.getElementById('logout').addEventListener('click', async () => {
+      await fetch('/api/logout', { method: 'POST' });
+      window.location.href = 'login.html';
+    });
+
+    document.getElementById('nickname-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const form = e.target;
+      const msg = document.getElementById('msg');
+      msg.textContent = '';
+      try {
+        const res = await fetch('/api/profile/nickname', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nickname: form.nickname.value.trim() }),
+        });
+        if (res.ok) {
+          msg.textContent = 'Nickname updated';
+          msg.className = 'msg ok';
+          loadProfile();
+        } else {
+          const data = await res.json().catch(() => ({}));
+          msg.textContent = data.error || 'Update failed';
+          msg.className = 'msg err';
+        }
+      } catch (err) {
+        msg.textContent = 'Network error';
+        msg.className = 'msg err';
+      }
+    });
+
+    document.getElementById('avatar-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const form = e.target;
+      const msg = document.getElementById('msg');
+      msg.textContent = '';
+      const file = form.avatar.files[0];
+      if (!file) return;
+      const fd = new FormData();
+      fd.append('avatar', file);
+      try {
+        const res = await fetch('/api/profile/avatar', {
+          method: 'POST',
+          body: fd,
+        });
+        if (res.ok) {
+          msg.textContent = 'Avatar updated';
+          msg.className = 'msg ok';
+          loadProfile();
+        } else {
+          const data = await res.json().catch(() => ({}));
+          msg.textContent = data.error || 'Upload failed';
+          msg.className = 'msg err';
+        }
+      } catch (err) {
+        msg.textContent = 'Network error';
+        msg.className = 'msg err';
+      }
+    });
+
+    loadProfile();
+  </script>
+</body>
+</html>
