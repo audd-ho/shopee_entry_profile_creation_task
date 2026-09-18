@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Login</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="card">
+    <h1>Login</h1>
+
+    <form id="login-form">
+      <label>
+        Username
+        <input type="text" name="username" required autocomplete="username" />
+      </label>
+
+      <label>
+        Password
+        <input type="password" name="password" required autocomplete="current-password" />
+      </label>
+
+      <button type="submit">Log in</button>
+    </form>
+
+    <p id="msg" class="msg"></p>
+
+    <p class="alt">
+      No account? <a href="signup.html">Sign up</a>
+    </p>
+  </main>
+
+  <script src="app.js"></script>
+  <script>
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const form = e.target;
+      const body = {
+        username: form.username.value.trim(),
+        password: form.password.value,
+      };
+      const msg = document.getElementById('msg');
+      msg.textContent = '';
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (res.ok) {
+          window.location.href = 'profile.html';
+        } else {
+          const data = await res.json().catch(() => ({}));
+          msg.textContent = data.error || 'Login failed';
+          msg.className = 'msg err';
+        }
+      } catch (err) {
+        msg.textContent = 'Network error';
+        msg.className = 'msg err';
+      }
+    });
+  </script>
+</body>
+</html>

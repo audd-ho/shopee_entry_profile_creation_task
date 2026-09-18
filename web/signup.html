@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Sign up</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="card">
+    <h1>Sign up</h1>
+
+    <form id="signup-form">
+      <label>
+        Username
+        <input type="text" name="username" required minlength="3" maxlength="32"
+               pattern="[a-zA-Z0-9_]+" autocomplete="username" />
+        <small>3-32 chars, letters/digits/underscore</small>
+      </label>
+
+      <label>
+        Password
+        <input type="password" name="password" required minlength="8" maxlength="72"
+               autocomplete="new-password" />
+        <small>at least 8 characters</small>
+      </label>
+
+      <label>
+        Nickname (optional)
+        <input type="text" name="nickname" maxlength="32" />
+      </label>
+
+      <button type="submit">Create account</button>
+    </form>
+
+    <p id="msg" class="msg"></p>
+
+    <p class="alt">
+      Already have an account? <a href="login.html">Log in</a>
+    </p>
+  </main>
+
+  <script src="app.js"></script>
+  <script>
+    document.getElementById('signup-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const form = e.target;
+      const body = {
+        username: form.username.value.trim(),
+        password: form.password.value,
+        nickname: form.nickname.value.trim(),
+      };
+      const msg = document.getElementById('msg');
+      msg.textContent = '';
+      try {
+        const res = await fetch('/api/signup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (res.ok) {
+          msg.textContent = 'Account created. Redirecting to login...';
+          msg.className = 'msg ok';
+          setTimeout(() => (window.location.href = 'login.html'), 800);
+        } else {
+          const data = await res.json().catch(() => ({}));
+          msg.textContent = data.error || 'Signup failed';
+          msg.className = 'msg err';
+        }
+      } catch (err) {
+        msg.textContent = 'Network error';
+        msg.className = 'msg err';
+      }
+    });
+  </script>
+</body>
+</html>

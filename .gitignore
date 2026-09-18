@@ -1,0 +1,34 @@
+# Go
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local env
+.env
+.env.local
+.env.*.local
+
+# Data / runtime
+uploads/*
+!uploads/.gitkeep
+*.db
+
+# Perf artifacts (keep write-ups, ignore raw profiles)
+perf/*.pprof
+perf/*.svg
+perf/*.trace
+
+# OS
+.DS_Store
+Thumbs.db

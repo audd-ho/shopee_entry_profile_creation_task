@@ -1,0 +1,40 @@
+# TODO: local dev infrastructure (MySQL + Redis).
+#
+# Bring up:  docker compose -f deploy/docker-compose.yml up -d
+# Tear down: docker compose -f deploy/docker-compose.yml down
+#
+# MySQL:  localhost:3306, user=app, pass=app, db=userdb
+# Redis:  localhost:6379
+
+version: "3.9"
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: entry_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: userdb
+      MYSQL_USER: app
+      MYSQL_PASSWORD: app
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ../schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_bin
+      - --max_connections=200
+
+  redis:
+    image: redis:7-alpine
+    container_name: entry_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  mysql-data:
+  redis-data:
