@@ -41,6 +41,10 @@ type Response struct {
 // Not used for now since json.Decoder has no size ceiling, this max bytes is more for bufio scanner with sc.Buffer(nil, maxframebytes)
 //const MaxFrameBytes = 4 * 1024 * 1024
 
+// no delimiter so this internal buffer of decoder will keep reading wrong and mark it as wrong, but wont throw it away and get stuck infinitely
+// TCP Server: read request error: invalid character 'C' looking for beginning of value
+// tcp had no message boundaries in of itself, thats why need framing protocols like http and etc, thats why cannot easily recover from such errors
+
 // free-list idea to prevent head of the line blocking due to one single connection (affect other connections)
 // possible but over engineered so KIV for now
 

@@ -23,13 +23,20 @@ import (
 	"context"
 	"encoding/json"
 	"entry_profile_creation/internal/protocol"
+	"errors"
+	"io"
 	"log"
 	"net"
 )
 
 // connection context to pass down to requests
 func (s *Server) handleConnection(ctx context.Context, connection net.Conn) {
-	defer connection.Close()
+	defer func() {
+		log.Printf("Connection closed: %v (local) to %v (remote)", connection.LocalAddr(), connection.RemoteAddr())
+		connection.Close()
+	}()
+
+	log.Printf("Connection accepted: %v (local) to %v (remote)", connection.LocalAddr(), connection.RemoteAddr())
 
 	cfr := protocol.NewConnectionFrameReader(connection)
 	cfw := protocol.NewConnectionFrameWriter(connection)
@@ -37,9 +44,19 @@ func (s *Server) handleConnection(ctx context.Context, connection net.Conn) {
 	for {
 		req, err := cfr.ReadRequest()
 		if err != nil {
+			// check for clean client disconnection (EOF)
+			// else, will keep reading socket since readable now that client disconnected, and the EOF will keep being read NOT into buffer, but an error return value + 0 bytes being read/copied, and loop infinitely
+			if errors.Is(err, io.EOF) {
+				log.Printf("TCP Server: client disconnected cleanly")
+				break // Exit the loop to close the connection			}
+			}
+
 			log.Printf("TCP Server: read request error: %v", err)
 			// skip this request
-			continue
+			//continue
+
+			// cannot skip request, just break connection since using json decoder with no way of recovering from bad decoding (cant throw away bytes/char from internal buffer, and tcp itself cant know when the next good message is, so need http or some framing or delimiter, which decoder itself dont really use other than json but json has its own problems like this, so hard to recover by clearing internal buffer and so just break)
+			break
 		}
 
 		go s.processRequest(ctx, cfw, req)
@@ -48,6 +65,9 @@ func (s *Server) handleConnection(ctx context.Context, connection net.Conn) {
 }
 
 func (s *Server) processRequest(ctx context.Context, cfw *protocol.ConnectionFrameWriter, req *protocol.Request) {
+
+	log.Printf("Processing Request: ReqId=%v", req.ReqId)
+
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("panic in op=%s: %v", req.Op, r)
