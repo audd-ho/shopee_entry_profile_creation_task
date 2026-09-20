@@ -44,11 +44,13 @@ import (
 
 type LockDataTCPConnection struct {
 	TCPAddress      string
+	connection      net.Conn
 	cfw             *protocol.ConnectionFrameWriter
 	mu              sync.Mutex // within the same connection
 	reqIdChannelMap map[uint64]chan *protocol.Response
 	reqId           atomic.Uint64
 	done            chan struct{} // signal a dead connection (Closed when readConnectionLoop exits)
+	closed          atomic.Bool
 }
 
 func NewLockDataTCPConnection(TCPConnectionAddress string) (*LockDataTCPConnection, error) {
@@ -65,6 +67,7 @@ func NewLockDataTCPConnection(TCPConnectionAddress string) (*LockDataTCPConnecti
 		cfw:             protocol.NewConnectionFrameWriter(connection),
 		reqIdChannelMap: make(map[uint64]chan *protocol.Response),
 		done:            make(chan struct{}), // initialised channel for the exit signal
+		closed:          atomic.Bool{},
 	}
 
 	go ldTCPc.readConnectionLoop(connection)
@@ -76,7 +79,10 @@ func (ldTCPc *LockDataTCPConnection) readConnectionLoop(connection net.Conn) {
 	cfr := protocol.NewConnectionFrameReader(connection)
 
 	defer func() {
-		connection.Close()
+		if !ldTCPc.closed.Load() {
+			// prevent double close
+			connection.Close()
+		}
 		ldTCPc.cleanupPendingRequests(errors.New("connection closed"))
 		close(ldTCPc.done) // signal maintainer loop to reconnect!
 	}()
@@ -121,9 +127,19 @@ func (ldTCPc *LockDataTCPConnection) cleanupPendingRequests(err error) {
 	}
 }
 
+func (ldTCPc *LockDataTCPConnection) close() {
+	ldTCPc.closed.Store(true)
+	ldTCPc.connection.Close()
+}
+
 type TCPConnectionPool struct {
 	ldconns       []atomic.Pointer[LockDataTCPConnection]
 	roundRobinIdx atomic.Uint64 // for the different connections
+
+	// for pool closure
+	stopChan chan struct{}
+	wg       sync.WaitGroup
+	closed   atomic.Bool
 }
 
 func NewTCPConnectionPool(TCPConnectionAddress string, size int) *TCPConnectionPool {
@@ -134,6 +150,7 @@ func NewTCPConnectionPool(TCPConnectionAddress string, size int) *TCPConnectionP
 	for i := 0; i < size; i++ {
 		// Launch background supervisor loop for slot 'i'
 		// It creates the connection and continuously reconnects if it drops
+		pool.wg.Add(1)
 		pool.maintainSlotConnection(i, TCPConnectionAddress)
 	}
 
@@ -142,23 +159,66 @@ func NewTCPConnectionPool(TCPConnectionAddress string, size int) *TCPConnectionP
 
 func (TCPcp *TCPConnectionPool) maintainSlotConnection(slotIdx int, addr string) {
 	go func() {
+		defer TCPcp.wg.Done()
+
 		for {
 			connection, err := NewLockDataTCPConnection(addr)
 			if err != nil {
 				log.Printf("[Pool] Slot %d connection to %s failed: %v. Retrying in 1s...", slotIdx, addr, err)
-				time.Sleep(1 * time.Second)
-				continue
+				// Sleep 1s, but wake up immediately if pool is closing
+				select {
+				case <-time.After(1 * time.Second):
+					continue
+				case <-TCPcp.stopChan:
+					log.Printf("[Pool (Retry) ] Slot %d maintainer exiting due to shutdown.", slotIdx)
+					return
+				}
 			}
 
 			// Atomically place the active connection into the slot
 			// Note: Replace with atomic.Pointer or a Mutex if accessed across goroutines mid-write
 			TCPcp.ldconns[slotIdx].Store(connection)
 
-			// Wait until this specific connection dies before attempting next loop iteration
-			<-connection.done
-			log.Printf("[Pool] Slot %d connection died. Reconnecting...", slotIdx)
+			// Wait until either:
+			// 1. The connection dies naturally (<-connection.done)
+			// 2. The pool shuts down (<-TCPcp.stopChan)
+			select {
+			case <-connection.done:
+				log.Printf("[Pool] Slot %d connection died. Reconnecting...", slotIdx)
+			case <-TCPcp.stopChan:
+				log.Printf("[Pool] Slot %d maintainer exiting due to shutdown.", slotIdx)
+				return
+			}
 		}
 	}()
+}
+
+func (TCPcp *TCPConnectionPool) Close() error {
+	// Ensure Close() is only executed once
+	if !TCPcp.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	log.Printf("[Pool] Shutting down connection pool...")
+
+	// 1. Signal all maintainer loops to stop reconnecting
+	close(TCPcp.stopChan)
+
+	// 2. Close all active connections currently held in slots
+	for i := range TCPcp.ldconns {
+		conn := TCPcp.ldconns[i].Swap(nil) // Atomically remove pointer and get old value
+		if conn != nil {
+			// Closing connection terminates its readConnectionLoop,
+			// which cleans up pending requests via cleanupPendingRequests()
+			conn.close()
+		}
+	}
+
+	// 3. Wait for all background maintainer goroutines to exit
+	TCPcp.wg.Wait()
+	log.Printf("[Pool] Shutdown complete.")
+
+	return nil
 }
 
 // in case no connections at all
