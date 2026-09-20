@@ -17,6 +17,7 @@ package httpserver
 
 import (
 	"context"
+	"entry_profile_creation/internal/protocol"
 	"log"
 	"net/http"
 	"runtime/debug"
@@ -36,7 +37,10 @@ func Chain(logicFinalInnermostHandler http.Handler, middlewares ...Middleware) h
 
 type ctxKey int
 
-const traceIdKey ctxKey = iota
+const (
+	traceIdKey ctxKey = iota
+	sessionTokenKey
+)
 
 func requestIdMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -85,16 +89,36 @@ func recoverMiddleware(h http.Handler) http.Handler {
 	})
 }
 
-// check if cookie present or not // login just dont use/add this middleware since login no cookie ?
+// authMiddleware requires a session cookie and puts the token on the context.
+//
+// It deliberately does NOT validate the token. Resolving sess:<token> means a
+// Redis lookup, Redis belongs to the TCP server, and asking the TCP server to
+// resolve it here would cost a whole extra round trip on every request — after
+// which the real handler would immediately make a second call carrying the same
+// token. So this only rejects the cheap case (no cookie at all) and forwards
+// the token; the handler's own op resolves it once, on the far side.
+//
+// The consequence to keep in mind: reaching a handler means the request HAD a
+// token, not that the token is valid. Handlers must still treat
+// ErrCodeUnauthorized from the backend as a real possibility.
 func authMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("session_id") == "" {
-
-			http.Error(w, http.StatusText(http.StatusUnauthorized)+": Cookie Missing", http.StatusUnauthorized)
+		token := ReadSessionCookie(r)
+		if token == "" {
+			writeError(w, http.StatusUnauthorized, string(protocol.ErrCodeUnauthorized))
+			return // without this, an unauthenticated request runs the handler anyway
 		}
 
-		h.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), sessionTokenKey, token)
+		h.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// sessionToken returns the token authMiddleware attached, or "" if the route
+// was not behind it.
+func sessionToken(r *http.Request) string {
+	token, _ := r.Context().Value(sessionTokenKey).(string)
+	return token
 }
 
 // every other route/function

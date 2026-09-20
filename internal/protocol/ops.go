@@ -75,6 +75,11 @@ type LogoutData struct {
 	Token string `json:"token"`
 }
 
+// LogoutResult is empty but must exist: a handler returning nil data produces a
+// response with no Data field, and the client's Call would have nothing to
+// unmarshal into.
+type LogoutResult struct{}
+
 type GetUserData struct {
 	Token string `json:"token"`
 }
@@ -104,3 +109,36 @@ type UpdateAvatarResult struct {
 	AvatarURL string `json:"avatar_url"`
 	Version   uint32 `json:"version"`
 }
+
+// --- Error codes ---
+//
+// Response.Error carries one of these codes rather than a prose message. The
+// TCP server decides what went wrong, the HTTP server decides what that means
+// in HTTP terms, and neither has to parse the other's English. Anything not on
+// this list is a bug and gets reported as ErrCodeInternal.
+//
+// ErrorCode implements error so handlers can `return nil, ErrCodeUnauthorized`
+// directly, and dispatch can tell a deliberate code from a leaked internal
+// error with errors.As.
+type ErrorCode string
+
+func (e ErrorCode) Error() string { return string(e) }
+
+const (
+	// ErrCodeInvalidInput: the payload failed validation on the server side.
+	ErrCodeInvalidInput ErrorCode = "invalid_input"
+
+	// ErrCodeDuplicateUsername: signup lost the race on uk_username.
+	ErrCodeDuplicateUsername ErrorCode = "duplicate_username"
+
+	// ErrCodeInvalidCredentials: unknown username OR wrong password. The two
+	// are deliberately indistinguishable so the endpoint cannot be used to
+	// enumerate which accounts exist.
+	ErrCodeInvalidCredentials ErrorCode = "invalid_credentials"
+
+	// ErrCodeUnauthorized: missing, unknown or expired session token.
+	ErrCodeUnauthorized ErrorCode = "unauthorized"
+
+	// ErrCodeInternal: anything else. Details stay in the server log.
+	ErrCodeInternal ErrorCode = "internal"
+)

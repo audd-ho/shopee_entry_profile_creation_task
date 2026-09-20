@@ -289,6 +289,13 @@ func (TCPcp *TCPConnectionPool) Call(ctx context.Context, op string, data, resp 
 			return errors.New(respData.Error)
 		}
 
+		// Ops that return no payload (logout) produce a response with no Data
+		// field; unmarshalling nil would fail with "unexpected end of JSON
+		// input" on a call that actually succeeded.
+		if len(respData.Data) == 0 || resp == nil {
+			return nil
+		}
+
 		// 5. Unmarshal raw json bytes into the output parameter 'resp'
 		if err := json.Unmarshal(respData.Data, resp); err != nil {
 			return fmt.Errorf("failed to unmarshal response payload: %w", err)
