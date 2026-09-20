@@ -14,7 +14,9 @@ package tcpserver
 
 import (
 	"context"
+	"entry_profile_creation/internal/cache"
 	"entry_profile_creation/internal/config"
+	"entry_profile_creation/internal/db"
 	"log"
 	"net"
 	"sync"
@@ -22,15 +24,21 @@ import (
 
 type Server struct {
 	cfg *config.Config
-	//	pool  *db.Pool
-	//	cache *cache.Client
+
+	// db is a *sql.DB for now. In phase 4 db.Handle is re-pointed at the custom
+	// pool and nothing in this package changes.
+	db    db.Handle
+	cache *cache.Client
 
 	listener net.Listener
 	wg       sync.WaitGroup
 }
 
-func NewServer(cfg *config.Config) *Server {
-	return &Server{cfg: cfg}
+// NewServer takes its dependencies rather than building them, so main owns the
+// lifetime of the database and Redis connections and the handlers stay testable
+// against substitutes.
+func NewServer(cfg *config.Config, dbh db.Handle, redis *cache.Client) *Server {
+	return &Server{cfg: cfg, db: dbh, cache: redis}
 }
 
 func (s *Server) Run(ctx context.Context) error {

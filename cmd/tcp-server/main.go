@@ -13,7 +13,9 @@ package main
 
 import (
 	"context"
+	"entry_profile_creation/internal/cache"
 	"entry_profile_creation/internal/config"
+	"entry_profile_creation/internal/db"
 	"entry_profile_creation/internal/tcpserver"
 	"log"
 	"os/signal"
@@ -21,13 +23,26 @@ import (
 )
 
 func main() {
-	// TODO: implement
 	cfg := config.Load()
 	// this server context part can learn and read about more
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	server := tcpserver.NewServer(cfg)
+	// Both of these ping on construction, so a bad DSN or a down Redis fails
+	// here at startup rather than on the first user request.
+	dbHandle, err := db.Open(ctx, &cfg.MySQL)
+	if err != nil {
+		log.Fatalf("tcp-server: mysql: %v", err)
+	}
+	defer dbHandle.Close()
+
+	redis, err := cache.New(&cfg.Redis, cfg.Session.TTL)
+	if err != nil {
+		log.Fatalf("tcp-server: redis: %v", err)
+	}
+	defer redis.Close()
+
+	server := tcpserver.NewServer(cfg, dbHandle, redis)
 	if err := server.Run(ctx); err != nil {
 		log.Fatalf("tcp-server: %v", err)
 	}

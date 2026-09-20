@@ -20,37 +20,76 @@ import (
 	"context"
 	"encoding/json"
 	"entry_profile_creation/internal/protocol"
+	"errors"
+	"log"
 )
 
+// dispatch routes one request to its handler and turns the (result, error)
+// pair into a protocol.Response.
+//
+// Handlers return a protocol.ErrorCode for anything the client is allowed to
+// know about. Any other error is a bug or an outage: it is logged here and
+// reported as "internal", so a MySQL message or a stack detail can never reach
+// the browser.
 func (s *Server) dispatch(ctx context.Context, req *protocol.Request) *protocol.Response {
-	var data any
+	var (
+		data any
+		err  error
+	)
+
 	switch req.Op {
 	case protocol.OpPing:
-		var pingReq protocol.PingReq
-		json.Unmarshal(req.Data, &pingReq)
-		data = s.handlePing(ctx, &pingReq)
+		var d protocol.PingReq
+		if err := json.Unmarshal(req.Data, &d); err != nil {
+			return errResponse(req.ReqId, string(protocol.ErrCodeInvalidInput))
+		}
+		data = s.handlePing(ctx, &d)
+
+	case protocol.OpSignup:
+		var d protocol.SignupData
+		if err := json.Unmarshal(req.Data, &d); err != nil {
+			return errResponse(req.ReqId, string(protocol.ErrCodeInvalidInput))
+		}
+		data, err = s.handleSignup(ctx, &d)
+
+	case protocol.OpLogin:
+		var d protocol.LoginData
+		if err := json.Unmarshal(req.Data, &d); err != nil {
+			return errResponse(req.ReqId, string(protocol.ErrCodeInvalidInput))
+		}
+		data, err = s.handleLogin(ctx, &d)
+
+	case protocol.OpLogout:
+		var d protocol.LogoutData
+		if err := json.Unmarshal(req.Data, &d); err != nil {
+			return errResponse(req.ReqId, string(protocol.ErrCodeInvalidInput))
+		}
+		data, err = s.handleLogout(ctx, &d)
+
+	case protocol.OpGetUser:
+		var d protocol.GetUserData
+		if err := json.Unmarshal(req.Data, &d); err != nil {
+			return errResponse(req.ReqId, string(protocol.ErrCodeInvalidInput))
+		}
+		data, err = s.handleGetUser(ctx, &d)
+
+	/* phase 5:
+	case protocol.OpUpdateNickname:
+	case protocol.OpUpdateAvatar:
+	*/
+
 	default:
 		return errResponse(req.ReqId, "unknown op: "+req.Op)
 	}
-	return okResponse(req.ReqId, data)
-	/*
-		var data any
-		switch req.Op {
-		case protocol.OpSignup:
-			data = s.handleSignup(ctx, req)
-		case protocol.OpLogin:
-			data = s.handleLogin(ctx, req)
-		case protocol.OpLogout:
-			data = s.handleLogout(ctx, req)
-		case protocol.OpGetUser:
-			data = s.handleGetUser(ctx, req)
-		case protocol.OpUpdateNickname:
-			data = s.handleUpdateNickname(ctx, req)
-		case protocol.OpUpdateAvatar:
-			data = s.handleUpdateAvatar(ctx, req)
-		default:
-			return errResponse(req.ReqId, "unknown op: "+req.Op)
+
+	if err != nil {
+		var code protocol.ErrorCode
+		if errors.As(err, &code) {
+			return errResponse(req.ReqId, string(code))
 		}
-		return okResponse(req.ReqId, data)
-	*/
+		log.Printf("op=%s req=%d unhandled error: %v", req.Op, req.ReqId, err)
+		return errResponse(req.ReqId, string(protocol.ErrCodeInternal))
+	}
+
+	return okResponse(req.ReqId, data)
 }

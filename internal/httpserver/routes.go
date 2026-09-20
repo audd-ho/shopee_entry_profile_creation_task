@@ -35,14 +35,19 @@ func (s *Server) buildRouter() http.Handler {
 	mux.HandleFunc("GET /api/ping", s.handleGETPing)
 	mux.HandleFunc("POST /api/ping", s.handlePOSTPing)
 
-	/*
-		mux.HandleFunc("/api/signup", s.handleSignup)
-		mux.HandleFunc("/api/login", s.handleLogin)
+	// Unauthenticated: these are how a caller obtains a session in the first
+	// place, so requiring one would be circular.
+	mux.HandleFunc("POST /api/signup", s.handleSignup)
+	mux.HandleFunc("POST /api/login", s.handleLogin)
 
-		mux.HandleFunc("/api/logout", authMiddleware(s.handleLogout))
-		mux.HandleFunc("/api/user", authMiddleware(s.handleUser))
-		mux.HandleFunc("/api/profile/nickname", authMiddleware(s.handleUpdateNickname))
-		mux.HandleFunc("/api/profile/avatar", authMiddleware(s.handleUpdateAvatar))
+	// Authenticated. authMiddleware is applied per route rather than globally,
+	// because the static file server and the two routes above must stay open.
+	mux.Handle("POST /api/logout", authMiddleware(http.HandlerFunc(s.handleLogout)))
+	mux.Handle("GET /api/user", authMiddleware(http.HandlerFunc(s.handleGetUser)))
+
+	/* phase 5:
+	mux.Handle("POST /api/profile/nickname", authMiddleware(http.HandlerFunc(s.handleUpdateNickname)))
+	mux.Handle("POST /api/profile/avatar", authMiddleware(http.HandlerFunc(s.handleUpdateAvatar)))
 	*/
 
 	return MiddlewareWrappers_NoAuth(mux)
