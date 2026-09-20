@@ -122,13 +122,13 @@ func (ldTCPc *LockDataTCPConnection) cleanupPendingRequests(err error) {
 }
 
 type TCPConnectionPool struct {
-	ldconns       []*LockDataTCPConnection
+	ldconns       []atomic.Pointer[LockDataTCPConnection]
 	roundRobinIdx atomic.Uint64 // for the different connections
 }
 
 func NewTCPConnectionPool(TCPConnectionAddress string, size int) *TCPConnectionPool {
 	pool := &TCPConnectionPool{
-		ldconns: make([]*LockDataTCPConnection, size),
+		ldconns: make([]atomic.Pointer[LockDataTCPConnection], size),
 	}
 
 	return pool
@@ -146,7 +146,7 @@ func (TCPcp *TCPConnectionPool) maintainSlotConnection(slotIdx int, addr string)
 
 			// Atomically place the active connection into the slot
 			// Note: Replace with atomic.Pointer or a Mutex if accessed across goroutines mid-write
-			TCPcp.ldconns[slotIdx] = connection
+			TCPcp.ldconns[slotIdx].Store(connection)
 
 			// Wait until this specific connection dies before attempting next loop iteration
 			<-connection.done
@@ -162,7 +162,7 @@ func (TCPcp *TCPConnectionPool) getConn() (*LockDataTCPConnection, error) {
 	// and if one dead, can at least move on to the next
 	for i := 0; i < int(totalConnections); i++ {
 		idx := TCPcp.roundRobinIdx.Add(1)
-		curConn := TCPcp.ldconns[idx%totalConnections]
+		curConn := TCPcp.ldconns[idx%totalConnections].Load()
 
 		if curConn != nil {
 			select {
