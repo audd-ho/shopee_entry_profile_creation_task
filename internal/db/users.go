@@ -6,25 +6,25 @@
 //   - GetUserByUsername(ctx, pool, username) (*model.User, error)
 //   - GetUserByID(ctx, pool, id) (*model.User, error)
 //   - InsertUser(ctx, pool, username, passwordHash, nickname) (int64, error)
-//       Handle duplicate-key error → return ErrDuplicateUsername
+//     Handle duplicate-key error → return ErrDuplicateUsername
 //   - UpdateNickname(ctx, pool, id, nickname) error
 //   - UpdateAvatar(ctx, pool, id, suffix) (newVersion uint32, err error)
-//       Atomic increment + set suffix via LAST_INSERT_ID trick
+//     Atomic increment + set suffix via LAST_INSERT_ID trick
 //
 // All queries use parameterized SQL (?)  — never string-concat.
 package db
 
 // ---------------------------------------------------------------------------
-// Phase 2 implementation: stock database/sql.
+// Phase 4: now running on the custom pool.
 //
-// The custom pool referenced above lands in phase 4. Until then the handle is
-// a *sql.DB and these helpers are the seam that the swap happens behind: the
-// function signatures are the contract callers depend on, the bodies are not.
+// Note how little moved. The Handle alias below was re-pointed from *sql.DB to
+// *Pool, Pool grew ExecContext/QueryRowContext with matching shapes, and the
+// query bodies are otherwise unchanged. That was the point of the phase 2
+// structure: the function signatures are the contract, the bodies are not.
 // ---------------------------------------------------------------------------
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -37,12 +37,11 @@ import (
 
 // Handle is the database handle every query helper in this package takes.
 //
-// It is deliberately a type alias rather than an interface. database/sql's
-// *sql.Row and *sql.Rows are concrete structs, not interfaces, so a custom pool
-// could never satisfy an interface written in terms of them. In phase 4 this
-// alias is re-pointed at *Pool and the bodies below are rewritten; every caller
-// in tcpserver keeps compiling untouched.
-type Handle = *sql.DB
+// It is a type alias rather than an interface. database/sql's *sql.Row and
+// *sql.Rows are concrete structs, so an interface written in terms of them
+// could never be satisfied by anything else — which is exactly why this became
+// an alias swap in phase 4 rather than an interface implementation.
+type Handle = *Pool
 
 // Sentinel errors. Callers in tcpserver must never see a driver-level or
 // database/sql error: sql.ErrNoRows and MySQL error numbers are translated
@@ -61,28 +60,21 @@ const mysqlErrDupEntry = 1062
 // themselves instead of surfacing as sporadic "invalid connection" errors.
 const connMaxLifetime = 5 * time.Minute
 
-// Open dials MySQL and returns a ready, verified handle.
+// Open builds the pool and verifies it can reach MySQL.
 func Open(ctx context.Context, cfg *config.MySQLConfig) (Handle, error) {
-	h, err := sql.Open("mysql", cfg.DSN)
+	p, err := New(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("db: open: %w", err)
+		return nil, err
 	}
 
-	h.SetMaxOpenConns(cfg.MaxOpen)
-	// Idle is deliberately equal to open. The default is 2, which would have
-	// the pool dialling and tearing down connections continuously as soon as
-	// concurrency exceeded 2 — the cost shows up as latency, not as an error.
-	h.SetMaxIdleConns(cfg.MaxOpen)
-	h.SetConnMaxLifetime(connMaxLifetime)
-
-	// sql.Open is lazy: it only parses the DSN, it does not connect. Without an
-	// explicit ping, a wrong password or a down server first surfaces on some
-	// unlucky user request rather than at boot.
-	if err := h.PingContext(ctx); err != nil {
-		h.Close()
-		return nil, fmt.Errorf("db: ping: %w", err)
+	// The pool dials lazily, so without an explicit ping a wrong password or a
+	// down server would first surface on some unlucky user request rather than
+	// at boot.
+	if err := p.PingContext(ctx); err != nil {
+		p.Close()
+		return nil, err
 	}
-	return h, nil
+	return p, nil
 }
 
 // All SQL is parameterised with `?`. No query in this package is ever built by
@@ -108,20 +100,19 @@ const (
 // password hash, and the hash must never leave the server.
 func GetUserByUsername(ctx context.Context, h Handle, username string) (*model.User, error) {
 	u := &model.User{Username: username}
-	// avatar_suffix is NULL until the first upload, so it cannot scan straight
-	// into a string.
-	var suffix sql.NullString
 
+	// avatar_suffix is NULL until the first upload. The custom scanner maps a
+	// NULL column to the destination's zero value, so this no longer needs the
+	// sql.NullString round trip the database/sql version used.
 	err := h.QueryRowContext(ctx, qGetUserByUsername, username).
-		Scan(&u.ID, &u.PasswordHash, &u.Nickname, &u.AvatarVersion, &suffix)
+		Scan(&u.ID, &u.PasswordHash, &u.Nickname, &u.AvatarVersion, &u.AvatarSuffix)
 	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	case errors.Is(err, ErrNoRows):
 		return nil, ErrUserNotFound
 	case err != nil:
 		return nil, fmt.Errorf("db: get user by username: %w", err)
 	}
 
-	u.AvatarSuffix = suffix.String
 	return u, nil
 }
 
@@ -130,18 +121,16 @@ func GetUserByUsername(ctx context.Context, h Handle, username string) (*model.U
 // narrow on a query that runs on every authenticated request.
 func GetUserByID(ctx context.Context, h Handle, id uint64) (*model.User, error) {
 	u := &model.User{}
-	var suffix sql.NullString
 
 	err := h.QueryRowContext(ctx, qGetUserByID, id).
-		Scan(&u.ID, &u.Username, &u.Nickname, &u.AvatarVersion, &suffix)
+		Scan(&u.ID, &u.Username, &u.Nickname, &u.AvatarVersion, &u.AvatarSuffix)
 	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	case errors.Is(err, ErrNoRows):
 		return nil, ErrUserNotFound
 	case err != nil:
 		return nil, fmt.Errorf("db: get user by id: %w", err)
 	}
 
-	u.AvatarSuffix = suffix.String
 	return u, nil
 }
 
