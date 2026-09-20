@@ -63,7 +63,9 @@ func NewLockDataTCPConnection(TCPConnectionAddress string) (*LockDataTCPConnecti
 	log.Printf("Dial to %v: success", TCPConnectionAddress)
 
 	ldTCPc := &LockDataTCPConnection{
-		TCPAddress:      TCPConnectionAddress,
+		TCPAddress: TCPConnectionAddress,
+		// Without this the field stays nil and close() panics on shutdown.
+		connection:      connection,
 		cfw:             protocol.NewConnectionFrameWriter(connection),
 		reqIdChannelMap: make(map[uint64]chan *protocol.Response),
 		done:            make(chan struct{}), // initialised channel for the exit signal
@@ -145,6 +147,9 @@ type TCPConnectionPool struct {
 func NewTCPConnectionPool(TCPConnectionAddress string, size int) *TCPConnectionPool {
 	pool := &TCPConnectionPool{
 		ldconns: make([]atomic.Pointer[LockDataTCPConnection], size),
+		// A nil channel makes close(stopChan) panic in Close(), and makes the
+		// <-stopChan cases in the maintainer loops block forever.
+		stopChan: make(chan struct{}),
 	}
 
 	for i := 0; i < size; i++ {

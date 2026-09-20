@@ -41,7 +41,7 @@ const (
 // --- Op-specific data payloads ---
 
 type PingReq struct {
-	Hi string `json: "hi"`
+	Hi string `json:"hi"`
 }
 
 type PingResp struct {

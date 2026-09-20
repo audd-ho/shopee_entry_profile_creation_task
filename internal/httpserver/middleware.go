@@ -65,7 +65,7 @@ type loggingResponseWriter struct {
 	status              int
 }
 
-func (lrw loggingResponseWriter) WriteHeader(code int) {
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
 	lrw.ResponseWriter.WriteHeader(code)
 	lrw.status = code
 }
