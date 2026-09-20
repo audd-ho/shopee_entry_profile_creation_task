@@ -57,7 +57,7 @@ func NewLockDataTCPConnection(TCPConnectionAddress string) (*LockDataTCPConnecti
 	log.Printf("Establishing TCP Connection to %v", TCPConnectionAddress)
 	connection, err := net.Dial("tcp", TCPConnectionAddress)
 	if err != nil {
-		log.Printf("Dial to %v: failed, %w", TCPConnectionAddress, err)
+		log.Printf("Dial to %v: failed, %v", TCPConnectionAddress, err)
 		return nil, fmt.Errorf("Dial to %v: failed, %w", TCPConnectionAddress, err)
 	}
 	log.Printf("Dial to %v: success", TCPConnectionAddress)
@@ -272,7 +272,7 @@ func (TCPcp *TCPConnectionPool) Call(ctx context.Context, op string, data, resp 
 	}()
 
 	if err = useConn.cfw.WriteRequest(&protocol.Request{ReqId: reqId, Op: op, Data: dataJson}); err != nil {
-		log.Printf("reqId %v write request failed: %w", reqId, err)
+		log.Printf("reqId %v write request failed: %v", reqId, err)
 		return fmt.Errorf("write request failed: %w", err)
 	}
 
