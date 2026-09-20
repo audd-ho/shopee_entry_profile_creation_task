@@ -131,6 +131,12 @@ func NewTCPConnectionPool(TCPConnectionAddress string, size int) *TCPConnectionP
 		ldconns: make([]atomic.Pointer[LockDataTCPConnection], size),
 	}
 
+	for i := 0; i < size; i++ {
+		// Launch background supervisor loop for slot 'i'
+		// It creates the connection and continuously reconnects if it drops
+		pool.maintainSlotConnection(i, TCPConnectionAddress)
+	}
+
 	return pool
 }
 
