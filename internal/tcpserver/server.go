@@ -7,6 +7,66 @@
 //   - Graceful shutdown: close listener, wait for in-flight handlers to drain
 //
 // Public API:
-//   func New(cfg *config.Config, pool *db.Pool, cache *cache.Client) (*Server, error)
-//   func (s *Server) Run(ctx context.Context) error
+//
+//	func New(cfg *config.Config, pool *db.Pool, cache *cache.Client) (*Server, error)
+//	func (s *Server) Run(ctx context.Context) error
 package tcpserver
+
+import (
+	"context"
+	"entry_profile_creation/internal/config"
+	"log"
+	"net"
+	"sync"
+)
+
+type Server struct {
+	cfg *config.Config
+	//	pool  *db.Pool
+	//	cache *cache.Client
+
+	listener net.Listener
+	wg       sync.WaitGroup
+}
+
+func NewServer(cfg *config.Config) *Server {
+	return &Server{cfg: cfg}
+}
+
+func (s *Server) Run(ctx context.Context) error {
+	listener, err := net.Listen("tcp", s.cfg.TCP.Addr)
+	if err != nil {
+		return err
+	}
+
+	s.listener = listener
+	log.Printf("tcp-server listening on %s", s.cfg.TCP.Addr)
+
+	// close listener when server context dones(closed, so can run sinc empty+closed), closes
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+	}()
+
+	for {
+		connection, err := listener.Accept()
+		if err != nil {
+			// Listener closed or fatal — exit
+			if ctx.Err() != nil { // server listening ended then break, else log accept error and continue
+				break
+			}
+			log.Printf("accept error: %v", err)
+			continue
+		}
+
+		s.wg.Add(1) // connections accepted
+
+		go func(conn net.Conn) {
+			defer s.wg.Done()
+			s.handleConnection(ctx, conn)
+		}(connection)
+	}
+
+	s.wg.Wait() // all connections closed before returning
+	return nil
+}

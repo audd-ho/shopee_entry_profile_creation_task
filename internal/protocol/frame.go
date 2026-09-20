@@ -86,16 +86,23 @@ func NewConnectionFrameReader(r io.Reader) *ConnectionFrameReader {
 }
 
 // tcp server side
-func (cfr *ConnectionFrameReader) ReadRequest(req *Request) error {
+func (cfr *ConnectionFrameReader) ReadRequest() (req *Request, err error) {
+	req = new(Request)
+
 	// take from connection, reader and decode into req
 	if err := cfr.dec.Decode(req); err != nil {
-		return err // return io.EOF unwrapped, callers can check for it
+		return nil, err // return io.EOF unwrapped, callers can check for it
 	}
-	return nil
+	return req, nil
 }
 
 // http server side
-func (cfr *ConnectionFrameReader) ReadResponse(resp *Response) error {
+func (cfr *ConnectionFrameReader) ReadResponse() (resp *Response, err error) {
+	resp = new(Response)
+
 	// take from connection, reader and decode into resp
-	return cfr.dec.Decode(resp)
+	if err := cfr.dec.Decode(resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }

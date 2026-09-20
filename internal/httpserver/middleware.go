@@ -36,13 +36,13 @@ func Chain(logicFinalInnermostHandler http.Handler, middlewares ...Middleware) h
 
 type ctxKey int
 
-const requestIdKey ctxKey = iota
+const traceIdKey ctxKey = iota
 
 func requestIdMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqId := "req-" + "" // random int or something
+		traceId := "traceId-" + "" // random int or something
 
-		ctx := context.WithValue(r.Context(), requestIdKey, reqId)
+		ctx := context.WithValue(r.Context(), traceIdKey, traceId)
 
 		h.ServeHTTP(w, r.WithContext(ctx))
 
