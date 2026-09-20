@@ -11,6 +11,24 @@
 // Run:    ./tcp-server (or `go run ./cmd/tcp-server`)
 package main
 
+import (
+	"context"
+	"entry_profile_creation/internal/config"
+	"entry_profile_creation/internal/tcpserver"
+	"log"
+	"os/signal"
+	"syscall"
+)
+
 func main() {
 	// TODO: implement
+	cfg := config.Load()
+	// this server context part can learn and read about more
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	server := tcpserver.NewServer(cfg)
+	if err := server.Run(ctx); err != nil {
+		log.Fatalf("tcp-server: %v", err)
+	}
 }
