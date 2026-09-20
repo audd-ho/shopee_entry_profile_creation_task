@@ -28,6 +28,8 @@ const (
 	OpGetUser        = "get_user"
 	OpUpdateNickname = "update_nickname"
 	OpUpdateAvatar   = "update_avatar"
+
+	OpPing = "ping"
 )
 
 // Response statuses.
@@ -37,6 +39,14 @@ const (
 )
 
 // --- Op-specific data payloads ---
+
+type PingReq struct {
+	Hi string `json: "hi"`
+}
+
+type PingResp struct {
+	Bye string `json:"bye"`
+}
 
 type SignupData struct {
 	Username string `json:"username"`
