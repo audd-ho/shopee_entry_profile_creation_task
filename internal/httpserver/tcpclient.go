@@ -39,27 +39,85 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type LockDataTCPConnection struct {
 	TCPAddress      string
 	cfw             *protocol.ConnectionFrameWriter
 	mu              sync.Mutex // within the same connection
-	reqIdChannelMap map[uint64]chan protocol.Response
+	reqIdChannelMap map[uint64]chan *protocol.Response
 	reqId           atomic.Uint64
+	done            chan struct{} // signal a dead connection (Closed when readConnectionLoop exits)
 }
 
-func NewLockDataTCPConnection(TCPConnectionAddress string) *LockDataTCPConnection {
+func NewLockDataTCPConnection(TCPConnectionAddress string) (*LockDataTCPConnection, error) {
 	log.Printf("Establishing TCP Connection to %v", TCPConnectionAddress)
 	connection, err := net.Dial("tcp", TCPConnectionAddress)
 	if err != nil {
-		log.Printf("Establishing TCP Connection to %v: failed", TCPConnectionAddress)
+		log.Printf("Dial to %v: failed, %w", TCPConnectionAddress, err)
+		return nil, fmt.Errorf("Dial to %v: failed, %w", TCPConnectionAddress, err)
 	}
-	log.Printf("Establishing TCP Connection to %v: success", TCPConnectionAddress)
+	log.Printf("Dial to %v: success", TCPConnectionAddress)
 
-	return &LockDataTCPConnection{
-		TCPAddress: TCPConnectionAddress,
-		cfw:        protocol.NewConnectionFrameWriter(connection),
+	ldTCPc := &LockDataTCPConnection{
+		TCPAddress:      TCPConnectionAddress,
+		cfw:             protocol.NewConnectionFrameWriter(connection),
+		reqIdChannelMap: make(map[uint64]chan *protocol.Response),
+		done:            make(chan struct{}), // initialised channel for the exit signal
+	}
+
+	go ldTCPc.readConnectionLoop(connection)
+
+	return ldTCPc, nil
+}
+
+func (ldTCPc *LockDataTCPConnection) readConnectionLoop(connection net.Conn) {
+	cfr := protocol.NewConnectionFrameReader(connection)
+
+	defer func() {
+		connection.Close()
+		ldTCPc.cleanupPendingRequests(errors.New("connection closed"))
+		close(ldTCPc.done) // signal maintainer loop to reconnect!
+	}()
+
+	for {
+		resp, err := cfr.ReadResponse()
+		if err != nil {
+			log.Printf("Connection to %s lost: %v", ldTCPc.TCPAddress, err)
+			// clean up remaining request that rely or waiting on this connection
+			ldTCPc.cleanupPendingRequests(err)
+			return
+		}
+
+		ldTCPc.mu.Lock()
+		ch, ok := ldTCPc.reqIdChannelMap[resp.ReqId]
+		ldTCPc.mu.Unlock()
+
+		if ok {
+			ch <- resp // unblocks the waiting Call() method in its goroutine
+		}
+	}
+}
+
+// Unblocks any goroutines waiting on this connection if it drops unexpectedly
+func (ldTCPc *LockDataTCPConnection) cleanupPendingRequests(err error) {
+	// 1. Lock briefly just to copy channels and drain the map
+	ldTCPc.mu.Lock()
+	pending := make(map[uint64]chan *protocol.Response, len(ldTCPc.reqIdChannelMap))
+	for reqId, ch := range ldTCPc.reqIdChannelMap {
+		pending[reqId] = ch
+		delete(ldTCPc.reqIdChannelMap, reqId) // Safe to delete here
+	}
+	ldTCPc.mu.Unlock() // Release lock BEFORE channel sends!
+
+	// 2. Unblock callers without holding the mutex
+	errResp := &protocol.Response{Error: fmt.Sprintf("connection closed: %v", err)}
+	for _, ch := range pending {
+		select {
+		case ch <- errResp:
+		default: // Prevents blocking if channel buffer is full or caller abandoned
+		}
 	}
 }
 
@@ -69,27 +127,72 @@ type TCPConnectionPool struct {
 }
 
 func NewTCPConnectionPool(TCPConnectionAddress string, size int) *TCPConnectionPool {
-	return &TCPConnectionPool{
-		//.. make size number of them
-		// round robin id initialise at 0 for % size to load balance
+	pool := &TCPConnectionPool{
+		ldconns: make([]*LockDataTCPConnection, size),
 	}
+
+	return pool
 }
 
-func (TCPcp *TCPConnectionPool) getConn() *LockDataTCPConnection {
-	return TCPcp.ldconns[TCPcp.roundRobinIdx.Add(1)]
+func (TCPcp *TCPConnectionPool) maintainSlotConnection(slotIdx int, addr string) {
+	go func() {
+		for {
+			connection, err := NewLockDataTCPConnection(addr)
+			if err != nil {
+				log.Printf("[Pool] Slot %d connection to %s failed: %v. Retrying in 1s...", slotIdx, addr, err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			// Atomically place the active connection into the slot
+			// Note: Replace with atomic.Pointer or a Mutex if accessed across goroutines mid-write
+			TCPcp.ldconns[slotIdx] = connection
+
+			// Wait until this specific connection dies before attempting next loop iteration
+			<-connection.done
+			log.Printf("[Pool] Slot %d connection died. Reconnecting...", slotIdx)
+		}
+	}()
+}
+
+// in case no connections at all
+func (TCPcp *TCPConnectionPool) getConn() (*LockDataTCPConnection, error) {
+	totalConnections := uint64(len(TCPcp.ldconns))
+	// check all 8, possible for all 8 to die maybe?, then prevent infinite loop
+	// and if one dead, can at least move on to the next
+	for i := 0; i < int(totalConnections); i++ {
+		idx := TCPcp.roundRobinIdx.Add(1)
+		curConn := TCPcp.ldconns[idx%totalConnections]
+
+		if curConn != nil {
+			select {
+			case <-curConn.done:
+				// connection is dead/reconnecting, check next slot
+				continue
+			default:
+				return curConn, nil
+			}
+		}
+	}
+
+	return nil, errors.New("no active TCP connections available in pool")
 }
 
 //intermediaates
 
 func (TCPcp *TCPConnectionPool) Call(ctx context.Context, op string, data, resp any) error {
-	useConn := TCPcp.getConn()
+	useConn, err := TCPcp.getConn()
+	if err != nil {
+		log.Printf("No connections for use right now (all DEAD), %v", err)
+		return err
+	}
 	reqId := useConn.reqId.Add(1)
 	dataJson, err := json.Marshal(data)
 	if err != nil {
 		log.Printf("reqId %v data json marshalling error, %v", reqId, err)
 		return err
 	}
-	respChan := make(chan protocol.Response, 1) // buffered with 1 to ensure reader gorotine can non-blockingly drop the patyload and move on if ctx times out or cancel while request in flight
+	respChan := make(chan *protocol.Response, 1) // buffered with 1 to ensure reader gorotine can non-blockingly drop the patyload and move on if ctx times out or cancel while request in flight
 
 	// order matters, else if response came but no map chan value to go to
 	useConn.mu.Lock()
