@@ -12,3 +12,34 @@
 //
 // Never use math/rand for these.
 package crypto
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+)
+
+const (
+	sessionTokenBytes = 32 // 256 bits of entropy -> 64 hex chars
+	avatarSuffixBytes = 4  // only needs to defeat path guessing -> 8 hex chars
+)
+
+// RandomHex returns nBytes of cryptographically secure randomness, lowercase
+// hex encoded, so the returned string is 2*nBytes long.
+//
+// This always reads from crypto/rand. math/rand is seeded predictably and its
+// internal state is recoverable from a handful of outputs, which would make
+// session tokens guessable.
+func RandomHex(nBytes int) (string, error) {
+	b := make([]byte, nBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("crypto: read random bytes: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// SessionToken returns a 64-character session token.
+func SessionToken() (string, error) { return RandomHex(sessionTokenBytes) }
+
+// AvatarSuffix returns an 8-character suffix for an avatar filename.
+func AvatarSuffix() (string, error) { return RandomHex(avatarSuffixBytes) }
