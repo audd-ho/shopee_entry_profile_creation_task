@@ -73,10 +73,19 @@ func (s *Server) dispatch(ctx context.Context, req *protocol.Request) *protocol.
 		}
 		data, err = s.handleGetUser(ctx, &d)
 
-	/* phase 5:
 	case protocol.OpUpdateNickname:
+		var d protocol.UpdateNicknameData
+		if err := json.Unmarshal(req.Data, &d); err != nil {
+			return errResponse(req.ReqId, string(protocol.ErrCodeInvalidInput))
+		}
+		data, err = s.handleUpdateNickname(ctx, &d)
+
 	case protocol.OpUpdateAvatar:
-	*/
+		var d protocol.UpdateAvatarData
+		if err := json.Unmarshal(req.Data, &d); err != nil {
+			return errResponse(req.ReqId, string(protocol.ErrCodeInvalidInput))
+		}
+		data, err = s.handleUpdateAvatar(ctx, &d)
 
 	default:
 		return errResponse(req.ReqId, "unknown op: "+req.Op)

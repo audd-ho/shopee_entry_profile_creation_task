@@ -45,10 +45,8 @@ func (s *Server) buildRouter() http.Handler {
 	mux.Handle("POST /api/logout", authMiddleware(http.HandlerFunc(s.handleLogout)))
 	mux.Handle("GET /api/user", authMiddleware(http.HandlerFunc(s.handleGetUser)))
 
-	/* phase 5:
 	mux.Handle("POST /api/profile/nickname", authMiddleware(http.HandlerFunc(s.handleUpdateNickname)))
 	mux.Handle("POST /api/profile/avatar", authMiddleware(http.HandlerFunc(s.handleUpdateAvatar)))
-	*/
 
 	return MiddlewareWrappers_NoAuth(mux)
 }

@@ -48,7 +48,7 @@
     async function loadProfile() {
       const msg = document.getElementById('msg');
       try {
-        const res = await fetch('/api/me');
+        const res = await fetch('/api/user');
         if (res.status === 401) {
           window.location.href = 'login.html';
           return;
@@ -58,7 +58,7 @@
         document.getElementById('username').textContent = data.username || '-';
         document.getElementById('nickname').textContent = data.nickname || '-';
         const img = document.getElementById('avatar');
-        img.src = data.avatar_url || 'default-avatar.png';
+        img.src = data.avatar_url || '/default.png';
       } catch (err) {
         msg.textContent = 'Could not load profile';
         msg.className = 'msg err';

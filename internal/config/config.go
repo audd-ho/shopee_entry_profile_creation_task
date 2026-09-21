@@ -36,6 +36,17 @@ type RedisConfig struct {
 	Password string
 	DB       int
 	PoolSize int // default 50
+
+	// UserCacheDisabled turns off the user:<username> and profile:<user_id>
+	// caches, for the "without cache layer" half of the performance runs.
+	// Sessions are NOT affected: they live in the same Redis but are what
+	// authentication depends on, so disabling them would measure the 401 path
+	// rather than the uncached one.
+	//
+	// Phrased negatively so the zero value leaves the cache ON. A positively
+	// named flag would silently disable the cache in every test and every
+	// caller that builds a RedisConfig without thinking about it.
+	UserCacheDisabled bool
 }
 type UploadsConfig struct {
 	Root     string // default "./uploads"
@@ -71,6 +82,9 @@ func Load() *Config {
 			Password: envStr("REDIS_PASSWORD", ""),
 			DB:       envInt("REDIS_DB", 0),
 			PoolSize: envInt("REDIS_POOL_SIZE", 50),
+			// CACHE_LAYER=off for a "without cache" run. Anything else, including
+			// unset, leaves it on.
+			UserCacheDisabled: envStr("CACHE_LAYER", "on") == "off",
 		},
 		Uploads: UploadsConfig{
 			Root:     envStr("UPLOADS_ROOT", "uploads"),

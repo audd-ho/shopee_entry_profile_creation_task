@@ -30,6 +30,7 @@ package cache
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -66,6 +67,12 @@ const (
 type Client struct {
 	rdb        *redis.Client
 	sessionTTL time.Duration
+
+	// userCacheDisabled makes the user:/profile: helpers in user.go report a
+	// miss and skip their writes, leaving sessions untouched. See
+	// config.RedisConfig.UserCacheDisabled for why this is the switch rather
+	// than flushing Redis or pointing at a dead address.
+	userCacheDisabled bool
 }
 
 // New builds a Redis client and verifies connectivity.
@@ -100,7 +107,15 @@ func New(cfg *config.RedisConfig, sessionTTL time.Duration) (*Client, error) {
 		return nil, fmt.Errorf("cache: ping redis at %s: %w", cfg.Addr, err)
 	}
 
-	return &Client{rdb: rdb, sessionTTL: sessionTTL}, nil
+	if cfg.UserCacheDisabled {
+		log.Printf("cache: user/profile cache DISABLED (CACHE_LAYER=off); sessions still cached")
+	}
+
+	return &Client{
+		rdb:               rdb,
+		sessionTTL:        sessionTTL,
+		userCacheDisabled: cfg.UserCacheDisabled,
+	}, nil
 }
 
 // Close releases the connection pool.

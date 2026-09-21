@@ -38,12 +38,13 @@
 package tcpserver
 
 // ---------------------------------------------------------------------------
-// Phase 3 implementation.
+// Phase 3 implementation, with the phase 5 caches now layered on top.
 //
-// Not yet here, deliberately: the Redis user:<username> and profile:<user_id>
-// caches described above. Those are phase 5, and adding them before there is a
-// working uncached path would mean debugging invalidation and SQL at once.
-// Every handler below therefore goes straight to MySQL.
+// The read paths are cache-aside: look in Redis, fall through to MySQL on a
+// miss, populate on the way back. Writes never update the cache, they delete it
+// (cache/invalidate.go). A Redis failure on either side is logged and ignored
+// rather than returned — the cache is an optimisation, and a service that 500s
+// because a cache is unreachable is worse than a slow one.
 // ---------------------------------------------------------------------------
 
 import (
@@ -101,7 +102,7 @@ func (s *Server) handleSignup(ctx context.Context, d *protocol.SignupData) (*pro
 
 // handleLogin authenticates and mints a session.
 func (s *Server) handleLogin(ctx context.Context, d *protocol.LoginData) (*protocol.LoginResult, error) {
-	user, err := db.GetUserByUsername(ctx, s.db, d.Username)
+	user, err := s.lookupUserForLogin(ctx, d.Username)
 	switch {
 	case errors.Is(err, db.ErrUserNotFound):
 		// Spend a bcrypt anyway. Returning immediately would make a missing
@@ -157,6 +158,23 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 		return nil, err
 	}
 
+	// The hot path for the whole service: every page load calls this. Serving
+	// it from profile:<user_id> is what keeps 10M rows from turning each one
+	// into a primary-key lookup in MySQL.
+	if profile, hit, cErr := s.cache.GetProfileCache(ctx, session.UserID); cErr != nil {
+		log.Printf("get_user: read profile cache for user %d: %v", session.UserID, cErr)
+	} else if hit {
+		return &protocol.GetUserResult{
+			UserID: session.UserID,
+			// From the session, not the cached record: the session already
+			// carries it, so storing a second copy would be one more thing to
+			// keep in sync.
+			Username:  session.Username,
+			Nickname:  profile.Nickname,
+			AvatarURL: profile.AvatarURL(session.UserID),
+		}, nil
+	}
+
 	user, err := db.GetUserByID(ctx, s.db, session.UserID)
 	switch {
 	case errors.Is(err, db.ErrUserNotFound):
@@ -171,6 +189,10 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 		return nil, protocol.ErrCodeInternal
 	}
 
+	if cErr := s.cache.SetProfileCache(ctx, user.ID, user.CachedProfile()); cErr != nil {
+		log.Printf("get_user: populate profile cache for user %d: %v", user.ID, cErr)
+	}
+
 	return &protocol.GetUserResult{
 		UserID:   user.ID,
 		Username: user.Username,
@@ -178,6 +200,36 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 		// Derived, never stored. See model.User.AvatarURL.
 		AvatarURL: user.AvatarURL(),
 	}, nil
+}
+
+// lookupUserForLogin resolves a username to a user, through user:<username>.
+//
+// Returns db.ErrUserNotFound for an unknown account so the caller's existing
+// switch is unchanged. Note that a miss is NOT cached: storing a negative entry
+// would let anyone fill Redis with keys for usernames that do not exist simply
+// by attempting logins. Unknown usernames therefore always cost a MySQL query,
+// which is acceptable because they also always cost a dummy bcrypt.
+func (s *Server) lookupUserForLogin(ctx context.Context, username string) (*model.User, error) {
+	if cached, hit, err := s.cache.GetUserCache(ctx, username); err != nil {
+		log.Printf("login: read user cache for %q: %v", username, err)
+	} else if hit {
+		return cached.User(username), nil
+	}
+
+	user, err := db.GetUserByUsername(ctx, s.db, username)
+	if err != nil {
+		return nil, err
+	}
+
+	// Populated before the password is verified, deliberately. The entry is a
+	// function of the row, not of whether this particular attempt succeeded, so
+	// caching it here means a user who fat-fingers their password twice still
+	// only costs one MySQL read.
+	if cErr := s.cache.SetUserCache(ctx, username, user.CachedUser()); cErr != nil {
+		log.Printf("login: populate user cache for %q: %v", username, cErr)
+	}
+
+	return user, nil
 }
 
 // resolveSession turns an opaque token into a session, or an error code.
