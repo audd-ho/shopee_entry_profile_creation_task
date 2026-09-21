@@ -31,7 +31,9 @@ Build a user management system supporting signup, login, and profile edit (nickn
 - 10M+ user rows in test DB.
 - 1000 concurrent HTTP requests supported.
 - **No cache:** 3k login RPS from ≥200 unique users, no socket/timeout errors. (Optional stretch: 10k RPS.)
+  - assumed log in without session cookie (no redis cache to store it tooß)
 - **With cache:** 6k login RPS, same conditions. (Optional stretch: 20k RPS.)
+  - assumed log in without session cookie
 
 ---
 
@@ -55,7 +57,7 @@ Build a user management system supporting signup, login, and profile edit (nickn
                                                    │       │
                                           ┌────────▼──┐ ┌──▼──────┐
                                           │  MySQL    │ │  Redis  │
-                                          │ (10M+ rows)│ │         │
+                                          │(10M+ rows)│ │         │
                                           │ custom    │ │ cache + │
                                           │ conn pool │ │ session │
                                           └───────────┘ └─────────┘
@@ -79,18 +81,46 @@ Each subsection: **Options → Considerations → Decision**. Mark decisions wit
 
 **Considerations:**
 - Plain Redis has no built-in DB connector; read-through requires modules (RedisGears) or a custom proxy — extra complexity, extra process.
-- Cache-aside is industry standard, gives us control over TTL, invalidation, cache key design.
-- Task says "cache should use Redis" — implying standard Redis, cache-aside.
+  - Complexity refers to
+    - Maintainability
+    - Debuggability
+    - Coupling
+- Cache-aside is industry standard.
+  - Provides greater control
+    - TTL
+    - invalidation
+    - cache key design
 - Cache-aside directly enables the 3k→6k RPS jump.
+  - No need to have read through based on requirements
+  - No reason to increase coupling and complexity(above) for these
+  - Easier to scale with cache-aside as well, more decoupled
 
 **Decision: Cache-aside.** 
 
 **Sub-decisions to make:**
-- What do we cache? (username → password hash + user row? full profile? both?)
-  - username to password hash since login is the performance requirement [profile image etc?]
-- TTL? (Login lookups: ~5-10 min. Profile: longer, e.g. 1 hr.)
+- What do we cache?
+  - username to password bcrypt hash since login is the performance requirement as well
+- TTL?
+  - Login lookups: ~5-10 min.
+  - Profile: longer, e.g. 1 hr.
 - Invalidation policy on profile edit: delete-on-write vs write-through?
-- Negative caching (cache "user not found" for a short TTL to protect against enumeration/lookup spam)?
+  - delete-on-write based on below
+- Negative caching (cache "user not found" for a short TTL to protect against enumeration/lookup spam)
+  - not needed for now, easy to implement in the future if need, not a priority
+- **DB versioning**
+  - Implement db versioning to remove cache/db sync problem
+  - For updates:
+    - only update if new_version > cache_version
+    - if current_version <= cache_version, = cache miss and lookup db for new_version
+  - For read:
+    - only read if current_version == cache_version
+    - if current_version < cache_version then db lookup for new_version + write to cache (goroutine) [ensure cache is latest + cache cant see < or > unless really check or use versioning in value, if versioning in key then is just != then write to cache is for both anyway]
+    - if current_version > cache_version then db lookup for current_version + write to cache (goroutine)
+  - version as part of cache key to ensure
+    - old version key or prefix/versions instantly unreachable without key-deletion
+    - TTL can clean up old keys since not accessed, unlike one single key that keeps having value changed
+    - no potentially error prone race condition
+  - versioning in DB to be column/row level and level of split of tables in db will be below
 
 **Invalidation strategy — decided:**
 
@@ -99,25 +129,29 @@ Two options considered:
 **(A) Delete-on-write (cache-aside invalidation):**
 ```
 UPDATE users SET nickname = ? WHERE id = ?
-DEL user:<username>
-DEL profile:<user_id>
+(AFTER)
+[separate goroutine]
+DEL user:<username>:old_version
+DEL profile:<user_id>:old_version
 ```
 Next reader misses cache, refetches from DB, populates cache.
 
 **(B) Write-through:**
 ```
 UPDATE users SET nickname = ? WHERE id = ?
-SET user:<username> <new full record>
-SET profile:<user_id> <new profile>
+(AFTER)
+[separate goroutine]
+SET user:<username>:new_version <new full record>
+SET profile:<user_id>:new_version <new profile>
 ```
 Cache always fresh; readers hit cache immediately.
 
 **Race analysis:** write-through has a subtle bug with concurrent writers:
 ```
-T=1: A: UPDATE nickname = "Alice"       T=2: B: UPDATE nickname = "Alicia"
-T=3: B: SET user:alice {nickname: "Alicia"}
-T=4: A: SET user:alice {nickname: "Alice"}   ← overwrites with older data
-Result: DB = "Alicia", Cache = "Alice"  (divergent until TTL)
+T=1: A: UPDATE nickname = "A"       T=2: B: UPDATE nickname = "B"
+T=3: B: SET user:alice {nickname: "B"}
+T=4: A: SET user:alice {nickname: "A"}   ← overwrites with older data
+Result: DB = "B", Cache = "A"  (divergent until TTL)
 ```
 Delete-on-write is race-safe (deleting is idempotent; next read refetches fresh).
 
@@ -125,21 +159,35 @@ Delete-on-write is race-safe (deleting is idempotent; next read refetches fresh)
 - Race-safe under concurrent writers
 - Simpler (no need to serialize full record on every write)
 - One extra DB read on next access — acceptable trade
-- Consistent with "cache-aside" pattern from top of section
+- Consistent with "cache-aside" pattern from on top
 
 **Invalidation triggers:**
 
 | Action | Keys to invalidate |
 |---|---|
-| Nickname update | `user:<username>`, `profile:<user_id>` |
-| Avatar update | `user:<username>`, `profile:<user_id>` |
-| Signup | `user:<username>` (only relevant if negative caching implemented) |
-| Logout | `sess:<token>` |
-| Password change (future) | `user:<username>` + all sessions for that user |
+| Nickname update | `user:<username>:old_row_version`, `profile:<user_id>:old_row_version` |
+| Avatar update | `user:<username>:old_row_version`, `profile:<user_id>:old_row_version` |
+| Signup | `user:<username>` (only relevant if negative caching implemented, not implemented) |
+| Logout | `sess:<token>` (pure cache, no db involvement, no need for versioning) |
+| Password change (future) | `user:<username>:old_row_version` + all sessions for that user |
 
 **Negative caching note:** if we implement "user not found" negative caching, signup MUST invalidate that marker (`DEL user:<newuser>`), else login for a just-created user would incorrectly report not-found for the TTL window. Currently deferred; add if enumeration attacks become a concern.
+- for the current set up, this is of a low priority but was considered.
 
-**Status: TBD** on remaining sub-decisions (what to cache, TTLs, negative caching).
+- versioning design
+  - per column versioning
+    - pros
+      - field A change does not mean field B change version, able to remain independent "decoupled"
+      - scalable if more fields in the future that needs
+    - cons
+      - harder to maintain with more fields and more field versioning
+      - greatly incentivise splitting table to like BNF form or something since to really be decoupled, need if field A change, dont affect field B in another table, FK by id
+      - no reason to do so for current needs + only 2 fields can change in a row so it is manageable + QUERY normally require majority of the entire row so if split up, have to query many table or join tables, overhead not earned + cache for these 2 fields that change contain BOTH fields so v1 in nickname and v1 in avatar so when one change and ther other dont? so may require cache to further split double lookup + cache contain almost the entire row of the db anyway so versioning on the entire row makes more sense too
+      - nickname change and avatar change are infrequent ops so unlikely to hold the lock of the table's ROW for too long to have any impact on the latency/overhead on the api endpoints
+  - per row versioning
+    - the inverse of the above actually, so this is preferred here for the DB
+
+**Implementation note (resolved in §4.4.4):** the per-row version above is a dedicated `row_version` column, separate from `avatar_version` (§4.4). `avatar_version` only bumps on avatar upload and is embedded in the served file's name; `row_version` bumps on *any* mutating write (nickname or avatar) and is embedded only in Redis keys (`user:<username>:v<row_version>`, `profile:<user_id>:v<row_version>`). Conflating the two would make a nickname-only edit point avatar URLs at a version whose file was never written — see §4.4.4 point 4 for the full race analysis.
 
 ---
 
@@ -169,7 +217,7 @@ Delete-on-write is race-safe (deleting is idempotent; next read refetches fresh)
 - Session key format: `sess:<random-256-bit>` → JSON `{user_id, created_at, ip, last_seen}`. [in redis]
   - ip is for different ip, suspicious behaviour, but if want to expand can use, if not, can leave as so, no problem, last seen for rolling refresh
 
-**Status: TBD** on TTL & sliding behavior.
+**Status:** sesssion cookie + TTL & sliding behavior.
 
 ---
 
@@ -183,14 +231,15 @@ Delete-on-write is race-safe (deleting is idempotent; next read refetches fresh)
 **Considerations:**
 - Never plaintext, never plain SHA.
 - bcrypt cost 10 ≈ ~50-100ms/hash on modern CPU. Cost 12 ≈ ~250-400ms.
-- Argon2id is stronger but slightly more complex to tune.
+- Argon2id is stronger but slightly more complex to tune. + use too much ram (can OOM on local machine, current infra).
 - **Perf impact:** login RPS test does 3k-20k login/sec. If every login re-hashes, at cost 10 we'd need ~150-1000 CPU cores just for bcrypt.
   - **Mitigation:** cache authenticated sessions in Redis; the RPS test likely reuses a small set of credentials → hashed password can be cached (as `username → bcrypt_hash`, verified in memory) OR test uses sessions after first login.
   - Need to clarify what the perf harness counts as a "login request".
 
 **Decision: bcrypt, cost 10.**  (Simplicity, sufficient for this task.)
 
-**Status: TBD** — confirm cost after seeing perf harness behavior.
+**Status:** — confirm cost after seeing perf harness behavior.
+-  scaled to cost = 5 to hit perf requirements, and cost = 5 > SHA-256 still, and has salt anyway so resist against rainbow table
 
 ---
 
@@ -220,7 +269,7 @@ Delete-on-write is race-safe (deleting is idempotent; next read refetches fresh)
 - Filesystem "bloat" is just disk usage, doesn't affect hot paths.
 - DB bloat is expensive (buffer pool waste, slower scans, big backups).
 
-**Decision: Filesystem, path in MySQL.** ✅
+**Decision: Filesystem, path in MySQL.**
 
 **Sub-decisions:**
 - **Default avatar:** all new users start with `avatar_version = 0` and `avatar_suffix = NULL`. Server serves a shared `default.png` (static asset, not per-user) in this state. Once user uploads, `avatar_version` becomes ≥ 1 and their uploaded file is served instead.
@@ -263,7 +312,7 @@ Real file formats have distinctive **magic numbers** in their first bytes:
 
 **Two "sniffs" — don't confuse:**
 - We sniff uploads (good, defensive)
-- Browser sniffs responses (bad by default, disable with `nosniff` header)
+- Browser sniffs responses (bad by default, disable with `nosniff` header) [`X-Content-Type-Options: nosniff`]
 
 ---
 
@@ -450,20 +499,35 @@ Example for user_id = 12345, version = 9:
    - **Mitigation:** none perfect; write file first, then DB update (reverse order gives a "broken but visible" state which is less confusing than "correct DB, missing file").
    - Rare event; self-heals on next upload.
 
+4. **`row_version` / `avatar_version` conflation race** — §4.1 decided **per-row** cache versioning: a single version number that bumps on *either* nickname update or avatar upload, used to build Redis cache keys (`user:<username>:v<N>`, `profile:<user_id>:v<N>`). `avatar_version` (this section) bumps **only** on avatar upload and is embedded in the served file's **name**, not just a cache key.
+   - **If these were the same column:** a nickname-only update would bump `avatar_version`, and the next avatar URL built from `id + avatar_version + avatar_suffix` would point at `<id>_v<new_version>_<suffix>.jpg` — a file that was never written (only the DB counter moved, no upload happened) → broken avatar image, even though the user never touched their avatar.
+   - **Fix:** keep them as two separate columns with two separate write paths:
+     - `avatar_version` — bumped only inside the avatar-upload flow (step 2 below). Used only to derive the on-disk filename / URL.
+     - `row_version` — bumped on *every* mutating write to the row (nickname update **or** avatar upload). Used only to build Redis cache keys per §4.1. Never appears in a filename or file path.
+   - Both use the same atomic `col = col + 1` pattern (MySQL guarantees no interleaving on a single row), so bumping both in the same `UPDATE` statement is one round trip, not two.
+
 **Chosen upload flow (single DB round trip via combined UPDATE):**
 ```
 1. Generate 8-char random suffix in Go (crypto/rand)
 2. MySQL:
       UPDATE users
       SET avatar_version = LAST_INSERT_ID(avatar_version + 1),
-          avatar_suffix  = ?
+          avatar_suffix  = ?,
+          row_version    = row_version + 1
       WHERE id = ?
-      → then SELECT LAST_INSERT_ID() to get new_version
+      → then SELECT LAST_INSERT_ID() to get new_avatar_version
    (One statement + trivial select — effectively one round trip.)
 3. Ensure dir exists: /uploads/<user_id >> 14>/<user_id>/  (idempotent MkdirAll)
-4. Write file to <dir>/<user_id>_v<new_version>_<suffix>.jpg.tmp
+4. Write file to <dir>/<user_id>_v<new_avatar_version>_<suffix>.jpg.tmp
 5. os.Rename(tmp, final) — atomic on POSIX
 6. Old files become orphans; async sweeper cleans them up periodically.
+7. [separate goroutine, after step 2 commits] DEL user:<username>:v<old_row_version>, DEL profile:<user_id>:v<old_row_version> — per §4.1 delete-on-write.
+```
+
+**Nickname update flow, for symmetry (no file involved, so only `row_version` moves):**
+```
+1. MySQL: UPDATE users SET nickname = ?, row_version = row_version + 1 WHERE id = ?
+2. [separate goroutine] DEL user:<username>:v<old_row_version>, DEL profile:<user_id>:v<old_row_version>
 ```
 
 **Why version stays in MySQL, not Redis:**
@@ -480,11 +544,13 @@ Example for user_id = 12345, version = 9:
 - Inline delete-on-upload would require reading previous suffix (extra round trip or `FOR UPDATE` locking).
 - Chose async sweeper instead: periodic job walks `/uploads/<bucket>/<user_id>/`, keeps only the current `<user_id>_v<avatar_version>_<avatar_suffix>.<ext>` file, deletes the rest.
 - Simpler upload path; orphans harmless (just disk).
+- simple sort of version in the names and keep the latest is easy
 
 **Schema updates for §5:**
 - Add `avatar_version INT UNSIGNED NOT NULL DEFAULT 0` (0 = no avatar uploaded)
 - Add `avatar_suffix CHAR(8) NULL` (nullable; NULL when no avatar)
 - Remove `avatar_path` (path is now derived, not stored)
+- Add `row_version BIGINT UNSIGNED NOT NULL DEFAULT 0` — per §4.1's per-row cache-versioning decision, bumped on nickname update **or** avatar upload; only ever read to build/tear down Redis cache keys, never used in a filename or path.
 
 ---
 
@@ -501,7 +567,7 @@ Example for user_id = 12345, version = 9:
 - Matches Twitter/GitHub/Discord/etc. — avatars are treated as public data.
 - Random suffix prevents enumeration.
 - Allows aggressive HTTP caching: `Cache-Control: public, max-age=31536000, immutable` (URL changes on new upload, so infinite cache is safe).
-- Deferred to future: CDN in front for production.
+- Deferred to future: CDN in front for production. ***[not implemented]***
 
 ---
 
@@ -511,7 +577,7 @@ Example for user_id = 12345, version = 9:
 - CDN in front for read-heavy workloads
 - Never BLOB in DB at scale
 
-**Status: ✅ locked-in.** Filename scheme, sharding, race handling, and access control all decided.
+**Status:** Filename scheme, sharding, race handling, and access control all decided.
 
 ---
 
@@ -539,11 +605,10 @@ Example for user_id = 12345, version = 9:
 | Boilerplate | More | Less | Less | Little |
 | Fit for entry task | ✅ Shows fundamentals | Common in industry | Risky (non-stdlib) | Good balance |
 
-**Recommendation:** `net/http` + `chi` for routing, OR `net/http` only if we want maximum from-scratch learning value.
-- `gin` is fine and common but hides some plumbing — an entry task is a chance to see it.
+`net/http` only if we want maximum from-scratch learning value.
 - The 3k-6k RPS target is easily hit by any of these; framework won't be the bottleneck.
 
-**Decision: TBD.** `net/http` for the learning angle. refresh mainly. Does not lose out ot the others other than boilerplate anyway.
+**Decision:** `net/http` for the learning angle. refresh mainly. Does not lose out to the others other than boilerplate anyway. [believed most appropriate for entry task? on my end]
 
 ---
 
@@ -584,16 +649,15 @@ Custom in each case means different things:
   - Awkward; fights the library.
 
 - **(C) Use a MySQL driver at the protocol level (`go-sql-driver/mysql`'s `Connector`), get individual raw MySQL connections, manage the pool ourselves.**
-  - True custom pool. Driver handles wire protocol; we handle lifecycle, checkout, health, prepared statements.
-  - Reasonable interpretation of the requirement.
+  - True custom pool. Driver handles wire protocol; we handle lifecycle, checkout, health, prepared statements. [what would need to be done]
+  - Reasonable interpretation of the requirement. [i think]
 
 - **(D) Full DIY** — implement the MySQL wire protocol ourselves over `net.Conn`.
-  - Way out of scope for an entry task. Do not do this.
+  - Way out of scope for an entry task. [i think?]
 
 **Which does the task mean?**
 - Task says: *"Connect by MySQL Go client. **Connection Pool should be built on your own.**"*
-- Most reasonable read: use the driver (Go MySQL client) for wire protocol, but the pool logic — acquire, release, size limits, waiters, health — is ours. That's **Option C**.
-- We should be prepared to explain in the TDD why (C) is the right level of abstraction.
+- Most reasonable read: use the driver (Go MySQL client) for wire protocol, but the pool logic — acquire, release, size limits, waiters, health — is the task ask. That's **Option C**.
 
 **Considerations:**
 - Pool size: too small → contention. Too big → MySQL connection limit (default 151), memory pressure.
@@ -605,14 +669,13 @@ Custom in each case means different things:
   - Health check / stale-connection eviction (ping, max lifetime, max idle time)
   - Per-connection **prepared statement cache** (MySQL prepares are per-connection)
   - Graceful shutdown (drain in-flight)
-- Metrics: in-use, idle, wait count, wait duration, evictions — for tuning.
+- Metrics: in-use, idle, wait count, wait duration, evictions — for tuning. [if time permits]
 
 **Concurrency model in Go:**
 - Channel of idle connections + `sync.Mutex` for size tracking, OR
 - Semaphore (buffered channel) for capacity + slice for idle list.
-- Standard patterns — well-documented.
 
-**Decision: Option C — direct driver connections, custom pool with prepared statement cache.** ✅ (Pending confirmation of Go.)
+**Decision: Option C — direct driver connections, custom pool with prepared statement cache.** 
 
 **Sub-decisions TBD:**
 - Max pool size (start 50, tune during perf test).
@@ -638,7 +701,7 @@ Re-reading the task: *"Connect by MySQL Go client. **Connection Pool should be b
 | Build custom Redis pool | Learning consistency, deeper practice, one abstraction across both stores. Redis pool is actually simpler than MySQL (no prepared stmts, no transactions). | ~1 extra day. Risk of subtle bugs (RESP edge cases, reconnection storms). Duplicates existing well-tuned library. |
 | Middle: thin wrapper around `go-redis` | ~2 hours. Get consistent API + custom metrics/timeouts across both stores. | Not truly custom; still relying on library for the hard parts. |
 
-**Not choosing "build custom" is deliberate, not lazy:**
+**Not choosing "build custom" is deliberate choice:**
 - MySQL pool is the interesting one (prepared statements, driver-level integration, protocol nuance).
 - Redis pool is mechanically similar but simpler → less learning per hour spent.
 - Battle-tested library removes risk from perf-critical path.
@@ -661,13 +724,13 @@ At 6k+ RPS, batching multiple Redis commands per round trip is a real win. Examp
 ```
 Login handler needs:
   1. GET user:<username>      (cache lookup)
-  2. INCR rl:login:ip:<ip>    (rate limit counter)
+  2. INCR rl:login:ip:<ip>    (rate limit counter) [rate limiting not implemented]
   3. SETEX sess:<token>       (create session)
 ```
 
 Un-pipelined: 3 round trips (~0.6 ms). Pipelined: 1 round trip (~0.2 ms). At scale this frees up significant time budget.
 
-`go-redis` supports pipelines natively. Consider using where multiple commands are needed in one handler.
+`go-redis` supports pipelines natively. May consider using where multiple commands are needed in one handler.
 
 **Health checking:**
 - `go-redis` handles this automatically (PING before use if connection idle beyond threshold).
@@ -690,38 +753,46 @@ With a small pool of persistent connections (8-16) and **multiplexing** (send re
 
 **Options:**
 - (A) **Length-prefixed binary frames** — `[4-byte length][1-byte msg_type][payload]`, payload is JSON or protobuf.
-- (B) **JSON lines** over TCP (newline-delimited: `{req_id, op, data}\n` each way).
+- (B) **JSON over TCP** (newline-terminated: `{req_id, op, data}\n` each way). Two ways to implement the read side:
+  - **(B1) True JSON-lines** — reader uses `bufio.Scanner`/`bufio.Reader` split on `'\n'`, then `json.Unmarshal`s each line independently. The newline is the actual, enforced frame boundary; a scanner buffer size (`sc.Buffer(nil, maxFrameBytes)`) gives a hard per-frame size cap for free.
+  - **(B2) Streaming `json.Decoder`** — writer uses `json.NewEncoder(w).Encode()` (which happens to emit a trailing `\n`, but only as a courtesy for humans running `nc`); reader uses `json.NewDecoder(r).Decode()` repeatedly on the raw byte stream. Framing comes from JSON's own self-terminating grammar (matched braces), not from the newline — the decoder never looks for `'\n'` at all.
 - (C) **gRPC** (technically over HTTP/2, may violate "TCP server" constraint).
 - (D) **HTTP over the TCP link** (defeats the purpose of the constraint).
+- (E) **WebSocket.** Rejected for the same reason as (C)/(D): a WebSocket connection begins with an HTTP/1.1 `Upgrade: websocket` handshake, so the link would still be doing an HTTP exchange before any "real" traffic starts — not a real TCP protocol in the spirit of the constraint. It also solves a problem we don't have (framing) while adding one we don't need: mandatory client→server frame **masking**, exists purely to stop malicious browser JS from smuggling bytes through misbehaving HTTP proxies/caches — irrelevant between two Go processes we control. Still doesn't give multiplexing for free; `req_id` would have to be carried in the payload exactly as in (A)/(B). Needs an external library (`gorilla/websocket` or similar), same "not truly DIY" objection as (C).
 
 **Considerations:**
 - Task explicitly says HTTP and TCP are separate — should be a real TCP protocol, not HTTP-in-HTTP.
 - Binary framing is fast, unambiguous, easy to parse, but adds implementation time.
 - JSON payload is easy to debug; protobuf is faster + smaller but adds tooling.
-- gRPC is battle-tested but its HTTP/2 substrate is arguably "not TCP" — risky interpretation.
+- gRPC is battle-tested but its HTTP/2 substrate is arguably "not TCP" — risky interpretation. (on review now, i should have clarified)
+- WebSocket has the same "not really TCP" issue as gRPC/HTTP-over-TCP, plus browser/proxy-oriented overhead (masking, ping/pong, close handshake) that buys nothing server-to-server.
 - Need to handle: request/response correlation, connection reuse, timeouts, framing errors.
+- B1 vs B2 trade-off: B1's explicit `'\n'` boundary gives a well-defined resync point if a frame is malformed (skip to the next newline and keep going) and a natural max-frame-size cap via the scanner buffer. B2 has neither — `internal/protocol/frame.go` notes exactly this: once `json.Decoder` desyncs on unexpected bytes, "it will keep reading wrong... and get stuck infinitely" rather than recovering, and `MaxFrameBytes` is currently unused because the decoder has no size ceiling to hand it to.
 
-**Decision: (B) JSON lines over TCP — for v1.**
+**Decision: (B2) Streaming `json.Decoder`/`json.Encoder` over TCP — for v1, this is what's implemented.**
 
 Reasoning:
-- Simplest framing (`\n` delimits messages) — fewer bytes of custom code to write.
+- Chosen over B1 purely for ease of implementation — `encoding/json`'s `Decoder`/`Encoder` already handle buffering and value boundaries, so there was no `bufio.Scanner` + line-splitting + per-line `Unmarshal` to write by hand. Goal was getting the HTTP↔TCP link working end-to-end first.
 - Meets all requirements: real TCP protocol, custom framing, custom multiplexing via req_id.
 - Perf is fine for our 6k RPS target; JSON parse overhead is negligible compared to bcrypt/DB.
-- Debuggable: can `nc` to the TCP server and type JSON to test.
+- Debuggable: can `nc` to the TCP server and type JSON to test (the trailing `\n` from `Encode` makes manual typing convenient, even though the decoder doesn't require it).
 - Preserves the interesting design work (multiplexing over pooled connections) without spending time on binary encoding details.
+
+**Known follow-up (B2's resync/size-cap gap):** since correctness got priority over hardening for v1, a malformed frame can desync a connection with no defined recovery point, and there's no enforced max-frame-size. If revisited: either switch the read side to B1 (scanner + explicit buffer cap) without touching the write side, or move straight to (A) length-prefixed binary frames, which also removes the ambiguity around JSON's un-bounded frame size.
 
 **Deferred / stretch:**
 - Upgrade to **(A) length-prefixed binary frames** if time permits after perf targets are met. Binary framing:
   - Removes JSON parsing from hot path
-  - Eliminates ambiguity around newlines-in-strings
   - Gives us practice with real protocol design
-- Not on the critical path for the entry task; shelved unless there's time in the last week.
+  - Also fixes B2's missing resync point and size cap (see above)
+- Not on the critical path for the entry task; shelved unless there's time.
 
 **Message shape:**
 ```
 Request:  {"req_id": <int>, "op": "<string>", "data": {...}}\n
 Response: {"req_id": <int>, "status": "ok"|"err", "error": "...", "data": {...}}\n
 ```
+The trailing `\n` above is what `json.Encoder.Encode` emits; it's cosmetic for B2 (the decoder ignores it as whitespace) and would only become load-bearing if the read side were switched to B1.
 
 Ops we'll need:
 - `signup`, `login`, `logout`
@@ -733,14 +804,14 @@ Ops we'll need:
 - On send: allocate req_id, register channel, write frame.
 - On receive (single reader goroutine per connection): read frame, look up channel by req_id, deliver response, remove entry.
 
-**Sub-decisions TBD (tune during perf):**
-- Number of persistent TCP connections HTTP→TCP: start with 8-16.
+**Sub-decisions (tune during perf):**
+- Number of persistent TCP connections HTTP→TCP: start with 8. [on review, not bottleneck so 8 can stay as 8 for now]
 - Per-request timeout: 2s?
-- Idle connection health check / reconnect on failure.
+- Idle connection health check / reconnect on failure. [maintained connection for reconnect is implemented but health check pings for idle connection not implemented as of now]
 
 ---
 
-### 4.8 Rate Limiting
+### 4.8 Rate Limiting [rough design but not implemented]
 
 **Options:**
 - (A) Redis counter per IP + per username, sliding window / fixed window.
@@ -766,7 +837,7 @@ Ops we'll need:
 - Time cost of implementing it competes with the core deliverables (MySQL pool, HTTP↔TCP protocol, perf tuning).
 
 **Revisit trigger:**
-- If Days 11-14 have slack after primary goals met.
+- If have slack after primary goals met.
 - If perf tuning reveals bcrypt-on-invalid-attempts as a real bottleneck.
 - If security is called out during review.
 
@@ -841,9 +912,9 @@ http.Cookie{
 
 **Enforcement:** both HTTP server (early reject) and TCP server (source of truth).
 
-**Decision: as above.** ✅
+**Decision: as above.** 
 
-**Status: TBD** — tweak limits after review.
+- not sure if auth middleware to check for presence of cookie is counted as input validation as well but is present too, BUT not really "input"
 
 ---
 
@@ -869,10 +940,10 @@ db.Query("SELECT id, nickname FROM users WHERE username = ?", username)
 **Why:** MySQL prepares are per-connection; caching them saves parse cost on every query. At 3k-20k RPS this is meaningful.
 
 **Common statements to prepare:**
-- `SELECT id, password_hash, nickname, avatar_version, avatar_suffix FROM users WHERE username = ?`
-- `SELECT id, nickname, avatar_version, avatar_suffix FROM users WHERE id = ?`
-- `UPDATE users SET nickname = ? WHERE id = ?`
-- `UPDATE users SET avatar_version = LAST_INSERT_ID(avatar_version + 1), avatar_suffix = ? WHERE id = ?`
+- `SELECT id, password_hash, nickname, avatar_version, avatar_suffix, row_version FROM users WHERE username = ?`
+- `SELECT id, nickname, avatar_version, avatar_suffix, row_version FROM users WHERE id = ?`
+- `UPDATE users SET nickname = ?, row_version = row_version + 1 WHERE id = ?`
+- `UPDATE users SET avatar_version = LAST_INSERT_ID(avatar_version + 1), avatar_suffix = ?, row_version = row_version + 1 WHERE id = ?`
 - `INSERT INTO users (username, password_hash, nickname) VALUES (?, ?, ?)`
 
 **Decision: prepare-on-first-use per connection, cache for connection lifetime.** ✅
@@ -900,6 +971,7 @@ CREATE TABLE users (
   nickname       VARCHAR(128) NOT NULL,       -- 32 runes × up to 4 bytes
   avatar_version INT UNSIGNED NOT NULL DEFAULT 0,  -- 0 = no avatar uploaded
   avatar_suffix  CHAR(8)      NULL,           -- 8 hex chars (32 bits random); NULL when no avatar
+  row_version    BIGINT UNSIGNED NOT NULL DEFAULT 0,  -- bumped on ANY update (nickname or avatar); cache-key versioning only, see §4.1/§4.4.4
   created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
@@ -914,16 +986,19 @@ CREATE TABLE users (
 - `VARBINARY(60)` for bcrypt (fixed size).
 - Avatar path is **derived**, not stored: `/uploads/<id >> 14>/<id>/<id>_v<avatar_version>_<avatar_suffix>.jpg` (see §4.4).
 - Row footprint is ~12 bytes smaller than storing full path — meaningful at 10M rows for buffer pool efficiency.
+- `row_version` is a distinct counter from `avatar_version` (see §4.4.4) — it exists purely to build/tear down Redis cache keys per §4.1's per-row versioning decision, and never appears in an avatar filename.
 
 ### Redis keys
 
 | Key | Value | TTL |
 |---|---|---|
 | `sess:<token>` | JSON `{user_id, username, created_at, ip?, last_seen}` | 24h sliding |
-| `user:<username>` | JSON `{id, password_hash, nickname, avatar_version, avatar_suffix}` | 10 min |
-| `profile:<user_id>` | JSON `{nickname, avatar_version, avatar_suffix}` | 1 h |
+| `user:<username>:v<row_version>` | JSON `{id, password_hash, nickname, avatar_version, avatar_suffix}` | 10 min |
+| `profile:<user_id>:v<row_version>` | JSON `{nickname, avatar_version, avatar_suffix}` | 1 h |
 | `rl:login:ip:<ip>` | counter | 5 min |
 | `rl:login:user:<uname>` | counter | 15 min |
+
+**Why `row_version` is embedded in the key, not the value** (per §4.1): the previous version's key becomes unreachable the instant `row_version` bumps in MySQL, without needing a delete to race against a concurrent read. The delete-on-write goroutine (§4.1, §4.4.4) still deletes the old key so it doesn't linger to TTL, but correctness doesn't depend on that delete winning any race.
 
 **Cache-key design rationale:**
 
@@ -937,25 +1012,26 @@ CREATE TABLE users (
   - Different index keys naturally — username lookup for login, id lookup for profile.
 - **`sess:<token>` and rate-limit keys** are separate concerns (session state, counters); no user data leaks in them.
 
-**Why session stores `username` alongside `user_id`:**
+**Why session stores `username` alongside `user_id`:** [login password hash value uses username as key, other internal uses user_id as key, since username is unique, technically can use it everywhere but user_id is more easy to scale to more things]
 
 Every authenticated request must look up the session in Redis for auth (verify token exists, get identity). By storing **both** `user_id` and `username` in the session record, we get both identifiers in one Redis GET. This matters for cache invalidation on profile edits:
 
 ```
 Nickname update flow:
   1. Redis GET sess:<token>  → {user_id: 42, username: "alice", ...}
-  2. MySQL UPDATE users SET nickname = ? WHERE id = 42
-  3. Redis DEL profile:42     (uses user_id from session)
-  4. Redis DEL user:alice     (uses username from session)
+  2. MySQL UPDATE users SET nickname = ?, row_version = row_version + 1 WHERE id = 42
+     → old_row_version known from the pre-update read (or SELECT row_version - 1 if not cached in-request)
+  3. Redis DEL profile:42:v<old_row_version>     (uses user_id from session)
+  4. Redis DEL user:alice:v<old_row_version>     (uses username from session)
 ```
 
-Without storing username in the session, step 4 would require an extra MySQL query to look up the username. The ~20 extra bytes per session record is negligible; the extra query is not. This is the session-record pulling **double duty** (auth check + identity retrieval for invalidation).
+Without storing username in the session, step 4 would require an extra MySQL query to look up the username. The ~20 extra bytes per session record is negligible; the extra query is not. This is the session-record pulling **double duty** (auth check + identity retrieval for invalidation). See §4.4.4 for why `row_version` is a separate counter from `avatar_version` and why it's the one embedded in these Redis keys.
 
 ### User table: no vertical split
 
 **Single `users` table, all columns together.** Considered vertical partitioning (splitting hot/cold columns into separate tables) but rejected:
-- Row width is ~130 bytes → 10M rows fits comfortably in typical buffer pool (~1.3 GB).
-- All columns are accessed together on the hot path (login pulls hash + nickname + avatar_*).
+- Row width is ~138 bytes (was ~130 before `row_version` added, §4.1/§4.4.4) → 10M rows still fits comfortably in typical buffer pool (~1.4 GB). The 8-byte `BIGINT` addition doesn't move the needle on this decision.
+- All columns are accessed together on the hot path (login pulls hash + nickname + avatar_* + `row_version` — the latter needed to build the Redis cache key, not just for the row's own data).
 - Splitting would add JOIN cost on every read for no memory or lock-contention benefit.
 - Query-level column selection (`SELECT` only what you need) already handles per-request data minimization.
 - Vertical partitioning would only pay off with rows >1 KB or clearly bimodal hot/cold access, neither of which applies.
@@ -986,15 +1062,17 @@ Without storing username in the session, step 4 would require an extra MySQL que
 
 | Threat | Mitigation | Status |
 |---|---|---|
-| Password theft from DB dump | bcrypt cost 10, per-user salt | ✅ |
+| Password theft from DB dump | bcrypt cost 5 (scaled down from cost 10 to hit the login-RPS targets, §4.3), per-user salt | ⚠️ Weaker margin than recommended cost 10-12 — a DB dump is cheaper to brute-force offline — but still salted (no rainbow tables) and stronger than unsalted SHA-256 |
 | Session hijack | HttpOnly + SameSite cookie, Redis-backed, TTL | ✅ |
 | Brute-force login | Redis rate limit per IP + per user | ⏸ Shelved (revisit if time permits) |
 | CSRF | SameSite=Lax cookie (double-submit token shelved) | ✅ (Lax) / ⏸ (token) |
 | SQL injection | Parameterized queries only | ✅ |
 | Malicious file upload | Size cap, MIME sniff, random filename, no exec on upload dir | ✅ |
-| Enumeration (which users exist) | Uniform error message on login failure | ✅ |
+| Enumeration (which users exist) | Uniform error message + dummy bcrypt verify on unknown username (constant-time, see note below) | ✅ |
 | MITM | TLS termination | Production only |
 | DoS | Rate limit + pool caps + timeouts | Partial |
+
+**Note on the bcrypt-cost / enumeration interaction:** bcrypt embeds its cost in the hash itself, so a login's actual speed is set by the cost the row was **seeded** at (5, per §4.3), not by the server's `BCRYPT_COST` config — that config only governs hashing a *new* signup and the dummy verify above. Keeping `BCRYPT_COST` matched to the seeded cost is what makes the dummy-verify mitigation actually constant-time; measured mismatch (real rows at cost 5, dummy verify at cost 10) would make a real login ~4.5ms and a fake one ~65ms — a 14x timing gap that leaks exactly which usernames exist, defeating the row above.
 
 ---
 
