@@ -29,6 +29,10 @@ perf/*.pprof
 perf/*.svg
 perf/*.trace
 
+# Load-test output: the scripts are source, the run artifacts are not.
+loadtest/results/
+loadtest/vegeta/
+
 # OS
 .DS_Store
 Thumbs.db
