@@ -11,14 +11,14 @@
 //
 //   - handleLogin(data)
 //     Try Redis GET user:<username>
-//     HIT → deserialize {id, password_hash, nickname, avatar_version, avatar_suffix}
+//     HIT → deserialize {id, password_hash, nickname, avatar_version, avatar_suffix, row_version}
 //     MISS → SELECT ... FROM users WHERE username = ?
 //     SET user:<username> with 10-min TTL
 //     If user not found → return err (uniform message)
 //     bcrypt.CompareHashAndPassword(hash, password)
 //     Mismatch → return err (uniform message)
 //     Generate 32-byte random session token (crypto/random.go)
-//     SETEX sess:<token> {user_id, username, created_at, ip, last_seen} 24h
+//     SETEX sess:<token> {user_id, username, row_version, created_at, ip, last_seen} 24h
 //     Return {token, user_id, nickname, avatar_url}
 //
 //   - handleLogout(data)
@@ -126,7 +126,7 @@ func (s *Server) handleLogin(ctx context.Context, d *protocol.LoginData) (*proto
 		return nil, protocol.ErrCodeInternal
 	}
 
-	token, err := s.cache.CreateSession(ctx, user.ID, user.Username, d.IP)
+	token, err := s.cache.CreateSession(ctx, user.ID, user.RowVersion, user.Username, d.IP)
 	if err != nil {
 		log.Printf("login: create session for user %d: %v", user.ID, err)
 		return nil, protocol.ErrCodeInternal
@@ -159,9 +159,14 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 	}
 
 	// The hot path for the whole service: every page load calls this. Serving
-	// it from profile:<user_id> is what keeps 10M rows from turning each one
-	// into a primary-key lookup in MySQL.
-	if profile, hit, cErr := s.cache.GetProfileCache(ctx, session.UserID); cErr != nil {
+	// it from profile:<user_id>:v<row_version> is what keeps 10M rows from
+	// turning each one into a primary-key lookup in MySQL.
+	//
+	// session.RowVersion is a hint, not a confirmed value — see model.Session
+	// and cache.profileKey. Trying it costs nothing extra: session was already
+	// being read to resolve identity, so this is zero additional round trips
+	// on the path that matters, and a wrong guess is simply a miss.
+	if profile, hit, cErr := s.cache.GetProfileCache(ctx, session.UserID, session.RowVersion); cErr != nil {
 		log.Printf("get_user: read profile cache for user %d: %v", session.UserID, cErr)
 	} else if hit {
 		return &protocol.GetUserResult{
@@ -189,7 +194,14 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 		return nil, protocol.ErrCodeInternal
 	}
 
-	if cErr := s.cache.SetProfileCache(ctx, user.ID, user.CachedProfile()); cErr != nil {
+	// The session's hint was wrong (or absent) — correct it so the NEXT read
+	// on this session guesses right instead of missing every single time.
+	// Best-effort: see RefreshSessionRowVersion.
+	if session.RowVersion != user.RowVersion {
+		s.cache.RefreshSessionRowVersion(ctx, d.Token, session, user.RowVersion)
+	}
+
+	if cErr := s.cache.SetProfileCache(ctx, user.ID, user.RowVersion, user.CachedProfile()); cErr != nil {
 		log.Printf("get_user: populate profile cache for user %d: %v", user.ID, cErr)
 	}
 

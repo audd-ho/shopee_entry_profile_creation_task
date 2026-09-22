@@ -1,18 +1,18 @@
 // TODO: User-record cache helpers.
 //
 // Two key patterns (see §5):
-//   user:<username>   → JSON {id, password_hash, nickname, avatar_version, avatar_suffix}, TTL 10min
-//   profile:<user_id> → JSON {nickname, avatar_version, avatar_suffix}, TTL 1h
+//   user:<username>            → JSON {id, password_hash, nickname, avatar_version, avatar_suffix, row_version}, TTL 10min (key itself NOT versioned; see below)
+//   profile:<user_id>:v<row_version> → JSON {nickname, avatar_version, avatar_suffix}, TTL 1h
 //
 // Functions:
 //   - GetUserCache(ctx, username) (*model.UserCached, bool, error)
 //       GET user:<username>; returns (val, hit, err)
 //   - SetUserCache(ctx, username, user) error
 //       SETEX user:<username> 10min
-//   - GetProfileCache(ctx, userID) (*model.ProfileCached, bool, error)
-//       GET profile:<user_id>
-//   - SetProfileCache(ctx, userID, profile) error
-//       SETEX profile:<user_id> 1h
+//   - GetProfileCache(ctx, userID, rowVersion) (*model.ProfileCached, bool, error)
+//       GET profile:<user_id>:v<rowVersion>
+//   - SetProfileCache(ctx, userID, rowVersion, profile) error
+//       SETEX profile:<user_id>:v<rowVersion> 1h
 package cache
 
 // ---------------------------------------------------------------------------
@@ -52,10 +52,25 @@ const (
 	profileTTL = time.Hour
 )
 
+// userKey is deliberately unversioned — see the comment on model.UserCached
+// for why row_version cannot cheaply live in this particular key.
 func userKey(username string) string { return userKeyPrefix + username }
 
-func profileKey(userID uint64) string {
-	return profileKeyPrefix + strconv.FormatUint(userID, 10)
+// profileKey embeds row_version directly in the key (system_design.md §4.1),
+// so the previous version's key is structurally unreachable the instant
+// row_version bumps in MySQL — a reader can never repopulate it, because
+// nothing will ever ask for it again. The delete-on-write call in
+// invalidate.go still removes the old key so it does not linger to its TTL,
+// but correctness does not depend on that delete winning any race.
+//
+// This works cheaply for profile:<user_id> specifically because a caller
+// always has a version to try at near-zero cost: the session record already
+// carries one (see model.Session.RowVersion), and the session is being read
+// on every authenticated request anyway to resolve identity. A wrong guess
+// degrades to an ordinary cache miss, not an error — see
+// tcpserver.handleGetUser.
+func profileKey(userID uint64, rowVersion uint64) string {
+	return profileKeyPrefix + strconv.FormatUint(userID, 10) + ":v" + strconv.FormatUint(rowVersion, 10)
 }
 
 // getJSON is the shared body of both getters: a GET whose miss is a value, not
@@ -117,18 +132,22 @@ func (c *Client) SetUserCache(ctx context.Context, username string, u *model.Use
 	return setJSON(ctx, c, userKey(username), u, userTTL)
 }
 
-// GetProfileCache reads the display record for a user id.
-func (c *Client) GetProfileCache(ctx context.Context, userID uint64) (*model.ProfileCached, bool, error) {
+// GetProfileCache reads the display record for a user id at a specific
+// row_version — normally a hint carried on the caller's session, not a value
+// the caller has independently confirmed is current. See profileKey.
+func (c *Client) GetProfileCache(ctx context.Context, userID, rowVersion uint64) (*model.ProfileCached, bool, error) {
 	if c.userCacheDisabled {
 		return nil, false, nil
 	}
-	return getJSON[model.ProfileCached](ctx, c, profileKey(userID))
+	return getJSON[model.ProfileCached](ctx, c, profileKey(userID, rowVersion))
 }
 
-// SetProfileCache populates the display record after a MySQL read.
-func (c *Client) SetProfileCache(ctx context.Context, userID uint64, p *model.ProfileCached) error {
+// SetProfileCache populates the display record after a MySQL read, under the
+// row_version that MySQL read returned — never a guessed or stale value, or
+// this would cache the row under the wrong key.
+func (c *Client) SetProfileCache(ctx context.Context, userID, rowVersion uint64, p *model.ProfileCached) error {
 	if c.userCacheDisabled {
 		return nil
 	}
-	return setJSON(ctx, c, profileKey(userID), p, profileTTL)
+	return setJSON(ctx, c, profileKey(userID, rowVersion), p, profileTTL)
 }

@@ -31,6 +31,15 @@ type Session struct {
 	// session without a round trip to MySQL.
 	Username string `json:"username"`
 
+	// RowVersion is a hint, not a guarantee: the row_version this session's
+	// user had as of the last time this session learned it, either at login
+	// or from a subsequent profile-cache miss. A GetUser call tries
+	// profile:<user_id>:v<RowVersion> first; if the hint is stale the attempt
+	// just misses like any other cache miss, falls through to MySQL, and the
+	// hint gets corrected there (see cache.Client.RefreshSessionRowVersion).
+	// A wrong guess costs one extra miss, never incorrect data.
+	RowVersion uint64 `json:"row_version"`
+
 	CreatedAt time.Time `json:"created_at"`
 
 	// LastSeen is refreshed on activity to drive the sliding-window TTL.

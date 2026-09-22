@@ -100,6 +100,9 @@ func TestInsertAndGetUserByUsername(t *testing.T) {
 	if got.AvatarSuffix != "" {
 		t.Errorf("AvatarSuffix = %q, want \"\" for a NULL column", got.AvatarSuffix)
 	}
+	if got.RowVersion != 0 {
+		t.Errorf("RowVersion = %d, want 0 for a row that has never been updated", got.RowVersion)
+	}
 }
 
 func TestGetUserByID(t *testing.T) {
@@ -177,8 +180,12 @@ func TestUpdateNickname(t *testing.T) {
 	// An emoji doubles as a check that the column really is utf8mb4 and not
 	// MySQL's 3-byte "utf8".
 	const want = "Renamed 🦊"
-	if err := UpdateNickname(ctx, h, id, want); err != nil {
+	newRowVersion, err := UpdateNickname(ctx, h, id, want)
+	if err != nil {
 		t.Fatalf("UpdateNickname: %v", err)
+	}
+	if newRowVersion != 1 {
+		t.Errorf("new row_version = %d, want 1 (first mutating write on a fresh row)", newRowVersion)
 	}
 
 	got, err := GetUserByUsername(ctx, h, username)
@@ -188,6 +195,9 @@ func TestUpdateNickname(t *testing.T) {
 	if got.Nickname != want {
 		t.Errorf("Nickname = %q, want %q", got.Nickname, want)
 	}
+	if got.RowVersion != newRowVersion {
+		t.Errorf("stored row_version = %d, want %d (what UpdateNickname returned)", got.RowVersion, newRowVersion)
+	}
 }
 
 func TestUpdateAvatar(t *testing.T) {
@@ -196,20 +206,26 @@ func TestUpdateAvatar(t *testing.T) {
 
 	id, _, _ := insertTestUser(t, h, "Avatar")
 
-	v1, err := UpdateAvatar(ctx, h, id, "deadbeef")
+	v1, oldRV1, err := UpdateAvatar(ctx, h, id, "deadbeef")
 	if err != nil {
 		t.Fatalf("UpdateAvatar: %v", err)
 	}
 	if v1 != 1 {
 		t.Errorf("first version = %d, want 1", v1)
 	}
+	if oldRV1 != 0 {
+		t.Errorf("first old row_version = %d, want 0 (fresh row)", oldRV1)
+	}
 
-	v2, err := UpdateAvatar(ctx, h, id, "cafef00d")
+	v2, oldRV2, err := UpdateAvatar(ctx, h, id, "cafef00d")
 	if err != nil {
 		t.Fatalf("UpdateAvatar: %v", err)
 	}
 	if v2 != 2 {
 		t.Errorf("second version = %d, want 2", v2)
+	}
+	if oldRV2 != 1 {
+		t.Errorf("second old row_version = %d, want 1 (row_version after the first upload)", oldRV2)
 	}
 
 	got, err := GetUserByID(ctx, h, id)
@@ -218,6 +234,11 @@ func TestUpdateAvatar(t *testing.T) {
 	}
 	if got.AvatarVersion != 2 || got.AvatarSuffix != "cafef00d" {
 		t.Errorf("stored avatar = v%d/%q, want v2/%q", got.AvatarVersion, got.AvatarSuffix, "cafef00d")
+	}
+	// row_version bumps alongside avatar_version, not instead of it — both
+	// uploads mutated the row, so after two uploads it must read 2.
+	if got.RowVersion != 2 {
+		t.Errorf("stored row_version = %d, want 2 after two uploads", got.RowVersion)
 	}
 
 	wantURL := fmt.Sprintf("/uploads/%d/%d/%d_v2_cafef00d.jpg", id>>14, id, id)
@@ -229,7 +250,7 @@ func TestUpdateAvatar(t *testing.T) {
 func TestUpdateAvatarUnknownUser(t *testing.T) {
 	h := testHandle(t)
 
-	if _, err := UpdateAvatar(context.Background(), h, 1<<62, "deadbeef"); !errors.Is(err, ErrUserNotFound) {
+	if _, _, err := UpdateAvatar(context.Background(), h, 1<<62, "deadbeef"); !errors.Is(err, ErrUserNotFound) {
 		t.Errorf("UpdateAvatar error = %v, want ErrUserNotFound", err)
 	}
 }
@@ -253,7 +274,13 @@ func TestUpdateAvatarIsAtomic(t *testing.T) {
 	for i := range n {
 		go func() {
 			defer wg.Done()
-			versions[i], errs[i] = UpdateAvatar(ctx, h, id, fmt.Sprintf("%08x", i))
+			// oldRowVersion is deliberately not asserted here: under this much
+			// concurrency, which goroutine's pre-read runs when is exactly the
+			// "not required to be exact" slack the function's own comment
+			// documents. avatar_version is the one that must be a clean,
+			// collision-free sequence, because a real duplicate there would
+			// mean two uploads wrote the same file.
+			versions[i], _, errs[i] = UpdateAvatar(ctx, h, id, fmt.Sprintf("%08x", i))
 		}()
 	}
 	wg.Wait()

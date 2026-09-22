@@ -31,8 +31,15 @@ type User struct {
 	Nickname      string
 	AvatarVersion uint32 // 0 = no avatar uploaded yet
 	AvatarSuffix  string // 8 hex chars; empty when AvatarVersion == 0
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+
+	// RowVersion bumps on any mutating write (nickname update or avatar
+	// upload). It exists purely to build/tear down the Redis keys that cache
+	// this row (system_design.md §4.1, §4.4.4) — it is never used in a
+	// filename or path, and never shown to a client.
+	RowVersion uint64
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // DefaultAvatarURL is served for users who have never uploaded an avatar.
@@ -92,12 +99,23 @@ func AvatarURL(id uint64, version uint32, suffix string) string {
 // without touching MySQL. That is a deliberate trade: the hash is already
 // salted and slow to attack, and Redis is on the same trust boundary as the
 // database. It is still never sent anywhere near a client.
+//
+// Unlike profile:<user_id> (see ProfileCached), this key is NOT versioned —
+// login has no prior request to seed a version guess from (there is no
+// session yet; that is what login creates), so a reader would need either a
+// second Redis round trip or a MySQL read just to learn which versioned key
+// to GET, defeating the point of caching the hot path that matters most.
+// RowVersion is carried in the VALUE instead, purely so a cache-hit login can
+// seed the new session's row-version hint accurately (see cache/session.go),
+// rather than always seeding it at 0 and eating one guaranteed extra miss on
+// that session's first profile read.
 type UserCached struct {
 	ID            uint64 `json:"id"`
 	PasswordHash  []byte `json:"password_hash"`
 	Nickname      string `json:"nickname"`
 	AvatarVersion uint32 `json:"avatar_version"`
 	AvatarSuffix  string `json:"avatar_suffix,omitempty"`
+	RowVersion    uint64 `json:"row_version"`
 }
 
 // ProfileCached is the value stored under profile:<user_id>, serving get_user.
@@ -118,6 +136,7 @@ func (u *User) CachedUser() *UserCached {
 		Nickname:      u.Nickname,
 		AvatarVersion: u.AvatarVersion,
 		AvatarSuffix:  u.AvatarSuffix,
+		RowVersion:    u.RowVersion,
 	}
 }
 
@@ -140,6 +159,7 @@ func (c *UserCached) User(username string) *User {
 		Nickname:      c.Nickname,
 		AvatarVersion: c.AvatarVersion,
 		AvatarSuffix:  c.AvatarSuffix,
+		RowVersion:    c.RowVersion,
 	}
 }
 

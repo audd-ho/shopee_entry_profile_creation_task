@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS users (
     nickname       VARCHAR(128)    NOT NULL,
     avatar_version INT UNSIGNED    NOT NULL DEFAULT 0,
     avatar_suffix  CHAR(8)         NULL,
+    row_version    BIGINT UNSIGNED NOT NULL DEFAULT 0,  -- bumped on any mutating write; cache-key versioning only (§4.1/§4.4.4 of system_design.md), never used in a filename
     created_at     TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at     TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),

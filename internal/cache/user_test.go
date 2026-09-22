@@ -22,6 +22,7 @@ func sampleUser() *model.UserCached {
 		Nickname:      "Alice",
 		AvatarVersion: 3,
 		AvatarSuffix:  "deadbeef",
+		RowVersion:    5,
 	}
 }
 
@@ -47,6 +48,12 @@ func TestUserCacheRoundTrip(t *testing.T) {
 	}
 	if got.ID != 42 || got.Nickname != "Alice" || got.AvatarVersion != 3 {
 		t.Errorf("round trip lost fields: %+v", got)
+	}
+	// RowVersion must survive too: it is what lets a cache-hit login seed an
+	// accurate hint on the new session, instead of always seeding 0 and
+	// eating a guaranteed miss on that session's first profile read.
+	if got.RowVersion != 5 {
+		t.Errorf("RowVersion = %d, want 5", got.RowVersion)
 	}
 }
 
@@ -87,12 +94,13 @@ func TestProfileCacheRoundTripAndAvatarURL(t *testing.T) {
 	c, _ := newTestClient(t, testTTL)
 	ctx := context.Background()
 
+	const rowVersion = 5
 	profile := &model.ProfileCached{Nickname: "Alice", AvatarVersion: 3, AvatarSuffix: "deadbeef"}
-	if err := c.SetProfileCache(ctx, 42, profile); err != nil {
+	if err := c.SetProfileCache(ctx, 42, rowVersion, profile); err != nil {
 		t.Fatalf("SetProfileCache: %v", err)
 	}
 
-	got, hit, err := c.GetProfileCache(ctx, 42)
+	got, hit, err := c.GetProfileCache(ctx, 42, rowVersion)
 	if err != nil || !hit {
 		t.Fatalf("GetProfileCache: hit=%v err=%v", hit, err)
 	}
@@ -101,6 +109,27 @@ func TestProfileCacheRoundTripAndAvatarURL(t *testing.T) {
 	want := (&model.User{ID: 42, AvatarVersion: 3, AvatarSuffix: "deadbeef"}).AvatarURL()
 	if got.AvatarURL(42) != want {
 		t.Errorf("avatar url = %q, want %q", got.AvatarURL(42), want)
+	}
+}
+
+// The whole point of embedding row_version in the key: a stale guess is
+// invisible to the caller as anything other than an ordinary cache miss, not
+// an error and not stale data. This is what makes the scheme safe even though
+// nothing validates the guess before trying it.
+func TestProfileCacheWrongVersionGuessIsJustAMiss(t *testing.T) {
+	c, _ := newTestClient(t, testTTL)
+	ctx := context.Background()
+
+	if err := c.SetProfileCache(ctx, 42, 5, &model.ProfileCached{Nickname: "Alice"}); err != nil {
+		t.Fatalf("SetProfileCache: %v", err)
+	}
+
+	// A caller guessing an old, a skipped, or a not-yet-reached version must
+	// all see a plain miss — never the wrong user's data, never an error.
+	for _, guess := range []uint64{0, 4, 6, 999} {
+		if _, hit, err := c.GetProfileCache(ctx, 42, guess); err != nil || hit {
+			t.Errorf("guess v%d: hit=%v err=%v, want a clean miss", guess, hit, err)
+		}
 	}
 }
 
@@ -114,8 +143,8 @@ func TestUserAndProfileKeysDoNotCollide(t *testing.T) {
 		t.Fatalf("SetUserCache: %v", err)
 	}
 
-	if _, hit, _ := c.GetProfileCache(ctx, 42); hit {
-		t.Error("user:42 was readable as profile:42")
+	if _, hit, _ := c.GetProfileCache(ctx, 42, 5); hit {
+		t.Error("user:42 was readable as profile:42:v5")
 	}
 }
 
@@ -123,14 +152,15 @@ func TestInvalidateOnNicknameChangeDropsBothKeys(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
+	const oldRowVersion = 5
 	if err := c.SetUserCache(ctx, "alice", sampleUser()); err != nil {
 		t.Fatalf("SetUserCache: %v", err)
 	}
-	if err := c.SetProfileCache(ctx, 42, &model.ProfileCached{Nickname: "Alice"}); err != nil {
+	if err := c.SetProfileCache(ctx, 42, oldRowVersion, &model.ProfileCached{Nickname: "Alice"}); err != nil {
 		t.Fatalf("SetProfileCache: %v", err)
 	}
 
-	if err := c.InvalidateOnNicknameChange(ctx, 42, "alice"); err != nil {
+	if err := c.InvalidateOnNicknameChange(ctx, 42, oldRowVersion, "alice"); err != nil {
 		t.Fatalf("InvalidateOnNicknameChange: %v", err)
 	}
 
@@ -139,8 +169,8 @@ func TestInvalidateOnNicknameChangeDropsBothKeys(t *testing.T) {
 	if mr.Exists(userKey("alice")) {
 		t.Error("user:alice survived invalidation")
 	}
-	if mr.Exists(profileKey(42)) {
-		t.Error("profile:42 survived invalidation")
+	if mr.Exists(profileKey(42, oldRowVersion)) {
+		t.Error("profile:42:v5 survived invalidation")
 	}
 }
 
@@ -151,7 +181,7 @@ func TestInvalidateIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 
 	for range 2 {
-		if err := c.InvalidateOnAvatarChange(ctx, 999, "ghost"); err != nil {
+		if err := c.InvalidateOnAvatarChange(ctx, 999, 3, "ghost"); err != nil {
 			t.Fatalf("InvalidateOnAvatarChange on absent keys: %v", err)
 		}
 	}
@@ -161,10 +191,11 @@ func TestInvalidateOnPasswordChangeSparesProfile(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
+	const rowVersion = 5
 	if err := c.SetUserCache(ctx, "alice", sampleUser()); err != nil {
 		t.Fatalf("SetUserCache: %v", err)
 	}
-	if err := c.SetProfileCache(ctx, 42, &model.ProfileCached{Nickname: "Alice"}); err != nil {
+	if err := c.SetProfileCache(ctx, 42, rowVersion, &model.ProfileCached{Nickname: "Alice"}); err != nil {
 		t.Fatalf("SetProfileCache: %v", err)
 	}
 
@@ -176,8 +207,8 @@ func TestInvalidateOnPasswordChangeSparesProfile(t *testing.T) {
 		t.Error("user:alice survived a password change")
 	}
 	// profile: never holds the hash, so dropping it would be pure cache churn.
-	if !mr.Exists(profileKey(42)) {
-		t.Error("profile:42 was dropped by a password change")
+	if !mr.Exists(profileKey(42, rowVersion)) {
+		t.Error("profile:42:v5 was dropped by a password change")
 	}
 }
 
@@ -206,10 +237,10 @@ func TestUserCacheDisabledAlwaysMisses(t *testing.T) {
 		t.Error("disabled cache reported a hit")
 	}
 
-	if err := c.SetProfileCache(ctx, 42, &model.ProfileCached{Nickname: "Alice"}); err != nil {
+	if err := c.SetProfileCache(ctx, 42, 5, &model.ProfileCached{Nickname: "Alice"}); err != nil {
 		t.Fatalf("SetProfileCache: %v", err)
 	}
-	if _, hit, _ := c.GetProfileCache(ctx, 42); hit {
+	if _, hit, _ := c.GetProfileCache(ctx, 42, 5); hit {
 		t.Error("disabled profile cache reported a hit")
 	}
 }
@@ -227,7 +258,7 @@ func TestUserCacheDisabledKeepsSessionsWorking(t *testing.T) {
 	t.Cleanup(func() { c.Close() })
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, "alice", "203.0.113.7")
+	token, err := c.CreateSession(ctx, 42, 5, "alice", "203.0.113.7")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -249,7 +280,7 @@ func TestCacheTTLs(t *testing.T) {
 	if err := c.SetUserCache(ctx, "alice", sampleUser()); err != nil {
 		t.Fatalf("SetUserCache: %v", err)
 	}
-	if err := c.SetProfileCache(ctx, 42, &model.ProfileCached{Nickname: "Alice"}); err != nil {
+	if err := c.SetProfileCache(ctx, 42, 5, &model.ProfileCached{Nickname: "Alice"}); err != nil {
 		t.Fatalf("SetProfileCache: %v", err)
 	}
 
@@ -259,7 +290,7 @@ func TestCacheTTLs(t *testing.T) {
 	if _, hit, _ := c.GetUserCache(ctx, "alice"); hit {
 		t.Errorf("user record outlived its %s TTL", userTTL)
 	}
-	if _, hit, _ := c.GetProfileCache(ctx, 42); !hit {
+	if _, hit, _ := c.GetProfileCache(ctx, 42, 5); !hit {
 		t.Errorf("profile record expired before its %s TTL", profileTTL)
 	}
 }

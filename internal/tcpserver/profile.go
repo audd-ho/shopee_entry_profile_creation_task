@@ -47,6 +47,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"entry_profile_creation/internal/crypto"
 	"entry_profile_creation/internal/db"
@@ -54,6 +55,39 @@ import (
 	"entry_profile_creation/internal/protocol"
 	"entry_profile_creation/internal/validate"
 )
+
+// invalidateTimeout bounds an async cache invalidation. Independent of the
+// request's own context (which is cancelled the moment the handler returns),
+// and short: a DEL is a single Redis round trip, so anything near this long
+// means Redis is in real trouble, not just slow.
+const invalidateTimeout = 2 * time.Second
+
+// invalidateAsync runs a cache invalidation in the background so a client's
+// response never waits on a Redis round trip that has no bearing on whether
+// their write actually succeeded — that was already decided in MySQL by the
+// time this fires (system_design.md §4.1, §4.4.4: "[separate goroutine]").
+//
+// Tracked on the server's own shutdown WaitGroup, so Run's graceful shutdown
+// drains outstanding invalidations rather than abandoning them mid-flight.
+//
+// This does widen the delete-on-write staleness window slightly: a client
+// could in principle re-fetch its own just-changed profile before the
+// goroutine's DEL has run, and see the value that was cached under the old
+// key a moment before. That is not a new failure mode — delete-on-write
+// already accepts staleness up to the TTL by design — it just stretches an
+// already-accepted window from "effectively zero" to "a goroutine schedule
+// delay", which is immaterial next to a 10-minute/1-hour TTL.
+func (s *Server) invalidateAsync(what string, fn func(ctx context.Context) error) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), invalidateTimeout)
+		defer cancel()
+		if err := fn(ctx); err != nil {
+			log.Printf("invalidate %s: %v", what, err)
+		}
+	}()
+}
 
 // handleUpdateNickname sets a new display name.
 func (s *Server) handleUpdateNickname(ctx context.Context, d *protocol.UpdateNicknameData) (*protocol.UpdateNicknameResult, error) {
@@ -70,17 +104,23 @@ func (s *Server) handleUpdateNickname(ctx context.Context, d *protocol.UpdateNic
 		return nil, protocol.ErrCodeInvalidInput
 	}
 
-	if err := db.UpdateNickname(ctx, s.db, session.UserID, nickname); err != nil {
+	newRowVersion, err := db.UpdateNickname(ctx, s.db, session.UserID, nickname)
+	if err != nil {
 		log.Printf("update_nickname: user %d: %v", session.UserID, err)
 		return nil, protocol.ErrCodeInternal
 	}
 
-	// After the write, and non-fatal. The row is already correct; a failed DEL
-	// only means a reader may see the old nickname until the TTL expires, which
-	// is not worth failing a succeeded update over.
-	if err := s.cache.InvalidateOnNicknameChange(ctx, session.UserID, session.Username); err != nil {
-		log.Printf("update_nickname: invalidate user %d: %v", session.UserID, err)
-	}
+	// After the write, and asynchronous (system_design.md §4.1's
+	// "[separate goroutine]"): the row is already correct in MySQL, so the
+	// client's response does not need to wait on a Redis round trip that
+	// cannot change whether the update succeeded. oldRowVersion is exact here
+	// (unlike UpdateAvatar's pre-read): row_version = row_version + 1 via
+	// LAST_INSERT_ID means newRowVersion is precisely what THIS statement set,
+	// so subtracting 1 is not a guess.
+	oldRowVersion := newRowVersion - 1
+	s.invalidateAsync("nickname", func(ctx context.Context) error {
+		return s.cache.InvalidateOnNicknameChange(ctx, session.UserID, oldRowVersion, session.Username)
+	})
 
 	return &protocol.UpdateNicknameResult{Nickname: nickname}, nil
 }
@@ -121,7 +161,18 @@ func (s *Server) handleUpdateAvatar(ctx context.Context, d *protocol.UpdateAvata
 		return nil, protocol.ErrCodeInternal
 	}
 
-	version, err := db.UpdateAvatar(ctx, s.db, session.UserID, suffix)
+	// NOTE (system_design.md §5 discussion, not yet decided): db.UpdateAvatar
+	// still commits the version bump before the file exists, so a crash
+	// between the two leaves the row pointing at a version whose file was
+	// never written. Dropping avatar_version in favour of a bare random
+	// suffix would let this go file-first/DB-second instead (no atomic
+	// counter to wait on), closing that failure mode — at the cost of a
+	// different one: a file written before its DB row exists looks like an
+	// orphan to anything sweeping by comparing against the DB, so a routine
+	// (not crash-only) sweep tick could delete it out from under the upload
+	// unless the sweeper is given a time-based grace period. Left as-is
+	// pending that decision.
+	newAvatarVersion, oldRowVersion, err := db.UpdateAvatar(ctx, s.db, session.UserID, suffix)
 	switch {
 	case errors.Is(err, db.ErrUserNotFound):
 		return nil, protocol.ErrCodeUnauthorized
@@ -130,18 +181,22 @@ func (s *Server) handleUpdateAvatar(ctx context.Context, d *protocol.UpdateAvata
 		return nil, protocol.ErrCodeInternal
 	}
 
-	if err := s.writeAvatarFile(session.UserID, version, suffix, raw); err != nil {
+	if err := s.writeAvatarFile(session.UserID, newAvatarVersion, suffix, raw); err != nil {
 		log.Printf("update_avatar: write file for user %d: %v", session.UserID, err)
 		return nil, protocol.ErrCodeInternal
 	}
 
-	if err := s.cache.InvalidateOnAvatarChange(ctx, session.UserID, session.Username); err != nil {
-		log.Printf("update_avatar: invalidate user %d: %v", session.UserID, err)
-	}
+	// Asynchronous, same reasoning as handleUpdateNickname. oldRowVersion here
+	// is a best-effort pre-read (see db.UpdateAvatar's comment), not an exact
+	// value the way handleUpdateNickname's is — that is fine, because an
+	// invalidation targeting a slightly-stale "old" key is still harmless.
+	s.invalidateAsync("avatar", func(ctx context.Context) error {
+		return s.cache.InvalidateOnAvatarChange(ctx, session.UserID, oldRowVersion, session.Username)
+	})
 
 	return &protocol.UpdateAvatarResult{
-		AvatarURL: model.AvatarURL(session.UserID, version, suffix),
-		Version:   version,
+		AvatarURL: model.AvatarURL(session.UserID, newAvatarVersion, suffix),
+		Version:   newAvatarVersion,
 	}, nil
 }
 

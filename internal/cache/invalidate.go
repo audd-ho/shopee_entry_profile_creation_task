@@ -3,11 +3,11 @@
 // Delete-on-write is race-safe under concurrent writers (deletes are idempotent).
 //
 // Functions:
-//   - InvalidateOnNicknameChange(ctx, userID, username) error
-//       DEL profile:<user_id>
+//   - InvalidateOnNicknameChange(ctx, userID, oldRowVersion, username) error
+//       DEL profile:<user_id>:v<oldRowVersion>
 //       DEL user:<username>
-//   - InvalidateOnAvatarChange(ctx, userID, username) error
-//       DEL profile:<user_id>
+//   - InvalidateOnAvatarChange(ctx, userID, oldRowVersion, username) error
+//       DEL profile:<user_id>:v<oldRowVersion>
 //       DEL user:<username>
 //   - InvalidateOnPasswordChange(ctx, username) error
 //       DEL user:<username>
@@ -48,21 +48,26 @@ func (c *Client) del(ctx context.Context, what string, keys ...string) error {
 
 // InvalidateOnNicknameChange drops both records that embed the nickname.
 //
-// The user: key has to go too, not just profile:. It is keyed by username and
-// read by login, but it carries a nickname copy, so leaving it would let a
-// login-path read serve the old display name for up to 10 minutes.
-func (c *Client) InvalidateOnNicknameChange(ctx context.Context, userID uint64, username string) error {
-	return c.del(ctx, "nickname", profileKey(userID), userKey(username))
+// oldRowVersion is the row_version from just before the write that triggered
+// this call — it targets the specific profile:<user_id>:v<N> key that write
+// stamped as stale. The user: key has to go too, not just profile:. It is
+// keyed by username and read by login, but it carries a nickname copy, so
+// leaving it would let a login-path read serve the old display name for up
+// to 10 minutes.
+func (c *Client) InvalidateOnNicknameChange(ctx context.Context, userID, oldRowVersion uint64, username string) error {
+	return c.del(ctx, "nickname", profileKey(userID, oldRowVersion), userKey(username))
 }
 
 // InvalidateOnAvatarChange drops both records that embed the avatar version.
 //
-// Strictly this is belt and braces: the avatar URL is versioned, so a stale
-// entry points at a file that still exists rather than at a broken image. It is
-// still dropped, because "the upload succeeded but my picture is unchanged" is
+// oldRowVersion is the row_version from just before the write, same reasoning
+// as InvalidateOnNicknameChange. Dropping profile: here is belt and braces —
+// the avatar URL is itself versioned, so a stale profile: entry would point at
+// a file that still exists rather than at a broken image — but it is still
+// dropped, because "the upload succeeded but my picture is unchanged" is
 // exactly the bug report this design is meant to make impossible.
-func (c *Client) InvalidateOnAvatarChange(ctx context.Context, userID uint64, username string) error {
-	return c.del(ctx, "avatar", profileKey(userID), userKey(username))
+func (c *Client) InvalidateOnAvatarChange(ctx context.Context, userID, oldRowVersion uint64, username string) error {
+	return c.del(ctx, "avatar", profileKey(userID, oldRowVersion), userKey(username))
 }
 
 // InvalidateOnPasswordChange drops the record holding the bcrypt hash.

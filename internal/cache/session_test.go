@@ -36,7 +36,7 @@ func TestSessionSetAndGet(t *testing.T) {
 	c, _ := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, "alice", "203.0.113.7")
+	token, err := c.CreateSession(ctx, 42, 7, "alice", "203.0.113.7")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -51,6 +51,12 @@ func TestSessionSetAndGet(t *testing.T) {
 
 	if got.UserID != 42 {
 		t.Errorf("UserID = %d, want 42", got.UserID)
+	}
+	// The row_version hint must survive the round trip: it is what lets the
+	// first GetUser call on this session try the right profile: key instead
+	// of guessing 0 and eating a guaranteed miss.
+	if got.RowVersion != 7 {
+		t.Errorf("RowVersion = %d, want 7", got.RowVersion)
 	}
 	if got.Username != "alice" {
 		t.Errorf("Username = %q, want %q", got.Username, "alice")
@@ -75,7 +81,7 @@ func TestSessionTokensAreDistinct(t *testing.T) {
 
 	seen := make(map[string]bool, 100)
 	for range 100 {
-		token, err := c.CreateSession(ctx, 1, "alice", "")
+		token, err := c.CreateSession(ctx, 1, 0, "alice", "")
 		if err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}
@@ -93,7 +99,7 @@ func TestSessionStoredValueOmitsToken(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 0, "alice", "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -107,6 +113,62 @@ func TestSessionStoredValueOmitsToken(t *testing.T) {
 	}
 	if !strings.Contains(stored, `"user_id":42`) {
 		t.Errorf("stored value missing user_id: %s", stored)
+	}
+}
+
+// TestRefreshSessionRowVersionUpdatesAndPersists checks both halves of the
+// contract: a genuine correction is written and visible on the next read, and
+// the fields RefreshSessionRowVersion is not supposed to touch survive.
+func TestRefreshSessionRowVersionUpdatesAndPersists(t *testing.T) {
+	c, _ := newTestClient(t, testTTL)
+	ctx := context.Background()
+
+	token, err := c.CreateSession(ctx, 42, 3, "alice", "")
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	session, err := c.GetSession(ctx, token)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+
+	c.RefreshSessionRowVersion(ctx, token, session, 9)
+
+	reread, err := c.GetSession(ctx, token)
+	if err != nil {
+		t.Fatalf("GetSession after refresh: %v", err)
+	}
+	if reread.RowVersion != 9 {
+		t.Errorf("RowVersion after refresh = %d, want 9", reread.RowVersion)
+	}
+	if reread.UserID != 42 || reread.Username != "alice" {
+		t.Errorf("refresh altered unrelated fields: %+v", reread)
+	}
+}
+
+// TestRefreshSessionRowVersionNoopWhenUnchanged guards the fast path: a
+// correct hint must not cost a write on every single GetUser call.
+func TestRefreshSessionRowVersionNoopWhenUnchanged(t *testing.T) {
+	c, mr := newTestClient(t, testTTL)
+	ctx := context.Background()
+
+	token, err := c.CreateSession(ctx, 42, 5, "alice", "")
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	session, err := c.GetSession(ctx, token)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+
+	before := mr.TTL(sessionKey(token))
+	// Same value as already stored: refresh must be a no-op, including not
+	// resetting the TTL the way a real correction (and GetSession's own late
+	// sliding-window refresh) legitimately would.
+	c.RefreshSessionRowVersion(ctx, token, session, 5)
+
+	if after := mr.TTL(sessionKey(token)); after != before {
+		t.Errorf("TTL changed on a no-op refresh: %v -> %v", before, after)
 	}
 }
 
@@ -126,7 +188,7 @@ func TestDeleteSession(t *testing.T) {
 	c, _ := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 0, "alice", "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -150,7 +212,7 @@ func TestSessionExpires(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 0, "alice", "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -169,7 +231,7 @@ func TestSlidingWindowHoldsOffEarly(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 0, "alice", "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -190,7 +252,7 @@ func TestSlidingWindowRefreshesLate(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 0, "alice", "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -231,7 +293,7 @@ func TestSlidingWindowSubSecondPrecision(t *testing.T) {
 	c, mr := newTestClient(t, shortTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 0, "alice", "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}

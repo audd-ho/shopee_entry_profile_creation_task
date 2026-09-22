@@ -53,7 +53,21 @@ type UploadsConfig struct {
 	MaxBytes int64  // default 2*1024*1024 (2MB)
 }
 type BcryptConfig struct {
-	Cost int // default 10
+	// Cost defaults to 5, per system_design.md §4.3/§7: scaled down from the
+	// textbook 10 specifically to hit the login-RPS targets, and is 1 above
+	// bcrypt's own hard floor (MinCost = 4; anything lower is silently
+	// replaced with cost 10 by golang.org/x/crypto/bcrypt, not rejected).
+	// Weaker than the 10-12 usually recommended for password storage — still
+	// salted, so still far stronger than unsalted SHA-256, but a stolen DB
+	// dump is cheaper to brute-force offline than at the textbook cost. This
+	// number MUST match whatever cost the seeder actually wrote (verify with
+	// `SELECT LEFT(password_hash,7) ...` — bcrypt embeds cost in the hash
+	// itself, so a mismatch here does not change how fast a real login
+	// verifies, only how fast the DummyVerify decoy runs, reopening the
+	// timing-based username-enumeration gap this cost is partly meant to
+	// close alongside the uniform error message. See auth.go's DummyVerify
+	// call.
+	Cost int
 }
 
 type SessionConfig struct {
@@ -91,7 +105,7 @@ func Load() *Config {
 			MaxBytes: int64(envInt("UPLOADS_MAX_BYTES", 2*1024*1024)),
 		},
 		Bcrypt: BcryptConfig{
-			Cost: envInt("BCRYPT_COST", 10),
+			Cost: envInt("BCRYPT_COST", 5),
 		},
 		Session: SessionConfig{
 			TTL: time.Duration(envInt("SESSION_TTL_SECONDS", 24*3600)) * time.Second,
