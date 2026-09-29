@@ -1,8 +1,8 @@
 // TODO: User-record cache helpers.
 //
 // Two key patterns (see §5):
-//   user:<username>            → JSON {id, password_hash, nickname, avatar_version, avatar_suffix, row_version}, TTL 10min (key itself NOT versioned; see below)
-//   profile:<user_id>:v<row_version> → JSON {nickname, avatar_version, avatar_suffix}, TTL 1h
+//   user:<username>            → JSON {id, password_hash, nickname, avatar_suffix, row_version}, TTL 10min (key itself NOT versioned; see below)
+//   profile:<user_id>:v<row_version> → JSON {nickname, avatar_suffix}, TTL 1h
 //
 // Functions:
 //   - GetUserCache(ctx, username) (*model.UserCached, bool, error)

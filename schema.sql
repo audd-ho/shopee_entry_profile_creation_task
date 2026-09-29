@@ -4,16 +4,21 @@
 --   - utf8mb4 for full unicode nicknames (emojis etc.)
 --   - VARBINARY(60) for bcrypt hash (fixed size)
 --   - Unique index on username for O(log n) login lookup at 10M rows
---   - avatar_version starts at 0 (means no avatar uploaded; server serves default.png)
---   - avatar_suffix is NULL when no avatar; 8 hex chars once uploaded
---   - Avatar file path is DERIVED from (id, avatar_version, avatar_suffix), not stored
+--   - avatar_suffix is NULL when no avatar uploaded (server serves default.png); 8 hex chars once uploaded
+--   - Avatar file path is DERIVED from (id, avatar_suffix), not stored. There is no
+--     avatar_version column: an earlier version of this schema had one, generated
+--     atomically in MySQL and embedded in the filename, which forced the database
+--     write to happen before the file existed (see internal/model/user.go's comment
+--     on AvatarRelPath for the failure mode that caused, and why a random suffix
+--     generated with no DB round trip replaced it).
+--   - row_version is unrelated to avatar_suffix: it bumps on ANY mutating write and
+--     exists purely to build/tear down Redis cache keys (§4.1/§4.4.4), never a filename
 
 CREATE TABLE IF NOT EXISTS users (
     id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     username       VARCHAR(32)     NOT NULL,
     password_hash  VARBINARY(60)   NOT NULL,
     nickname       VARCHAR(128)    NOT NULL,
-    avatar_version INT UNSIGNED    NOT NULL DEFAULT 0,
     avatar_suffix  CHAR(8)         NULL,
     row_version    BIGINT UNSIGNED NOT NULL DEFAULT 0,  -- bumped on any mutating write; cache-key versioning only (§4.1/§4.4.4 of system_design.md), never used in a filename
     created_at     TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,

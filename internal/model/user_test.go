@@ -69,37 +69,39 @@ func TestAvatarURL(t *testing.T) {
 			want: DefaultAvatarURL,
 		},
 		{
-			// A stale suffix must not resurrect a deleted avatar: version 0 is
-			// the single source of truth for "this user has no avatar".
-			name: "version zero wins over a leftover suffix",
-			user: User{ID: 42, AvatarVersion: 0, AvatarSuffix: "deadbeef"},
+			// An empty suffix is the single source of truth for "this user has
+			// no avatar" — there is no separate version column to check.
+			name: "empty suffix means no avatar",
+			user: User{ID: 42, AvatarSuffix: ""},
 			want: DefaultAvatarURL,
 		},
 		{
 			name: "first upload, shard 0",
-			user: User{ID: 1, AvatarVersion: 1, AvatarSuffix: "deadbeef"},
-			want: "/uploads/0/1/1_v1_deadbeef.jpg",
+			user: User{ID: 1, AvatarSuffix: "deadbeef"},
+			want: "/uploads/0/1/1_deadbeef.jpg",
 		},
 		{
 			name: "last id in shard 0",
-			user: User{ID: 16383, AvatarVersion: 1, AvatarSuffix: "deadbeef"},
-			want: "/uploads/0/16383/16383_v1_deadbeef.jpg",
+			user: User{ID: 16383, AvatarSuffix: "deadbeef"},
+			want: "/uploads/0/16383/16383_deadbeef.jpg",
 		},
 		{
 			name: "first id in shard 1",
-			user: User{ID: 16384, AvatarVersion: 1, AvatarSuffix: "deadbeef"},
-			want: "/uploads/1/16384/16384_v1_deadbeef.jpg",
+			user: User{ID: 16384, AvatarSuffix: "deadbeef"},
+			want: "/uploads/1/16384/16384_deadbeef.jpg",
 		},
 		{
-			// The version is what busts caches, so it must appear in the path.
-			name: "re-upload bumps the version in the path",
-			user: User{ID: 16384, AvatarVersion: 2, AvatarSuffix: "cafef00d"},
-			want: "/uploads/1/16384/16384_v2_cafef00d.jpg",
+			// The suffix alone is what busts caches now: a re-upload gets a
+			// fresh random suffix and therefore a new URL, with no version
+			// number involved anywhere.
+			name: "re-upload gets a fresh suffix, not a bumped version",
+			user: User{ID: 16384, AvatarSuffix: "cafef00d"},
+			want: "/uploads/1/16384/16384_cafef00d.jpg",
 		},
 		{
 			name: "ten millionth user",
-			user: User{ID: 10_000_000, AvatarVersion: 7, AvatarSuffix: "cafef00d"},
-			want: "/uploads/610/10000000/10000000_v7_cafef00d.jpg",
+			user: User{ID: 10_000_000, AvatarSuffix: "cafef00d"},
+			want: "/uploads/610/10000000/10000000_cafef00d.jpg",
 		},
 	}
 	for _, tt := range tests {

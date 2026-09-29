@@ -105,9 +105,13 @@ type UpdateAvatarData struct {
 	ImageB64 string `json:"image_b64"` // base64-encoded image bytes
 }
 
+// UpdateAvatarResult carries only the URL. There is no version number to
+// report: the design that had one (an avatar_version column, embedded in the
+// filename) was replaced by a bare random suffix — see
+// model.AvatarRelPath's comment for why — and nothing else in this service
+// needs a monotonic count of how many times a user has uploaded.
 type UpdateAvatarResult struct {
 	AvatarURL string `json:"avatar_url"`
-	Version   uint32 `json:"version"`
 }
 
 // --- Error codes ---

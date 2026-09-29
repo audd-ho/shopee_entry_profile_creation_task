@@ -8,8 +8,8 @@
 //   - InsertUser(ctx, pool, username, passwordHash, nickname) (int64, error)
 //     Handle duplicate-key error → return ErrDuplicateUsername
 //   - UpdateNickname(ctx, pool, id, nickname) (newRowVersion uint64, err error)
-//   - UpdateAvatar(ctx, pool, id, suffix) (newAvatarVersion uint32, oldRowVersion uint64, err error)
-//     Atomic increment + set suffix via LAST_INSERT_ID trick
+//   - UpdateAvatar(ctx, pool, id, suffix) (newRowVersion uint64, err error)
+//     Set suffix + atomic row_version increment via LAST_INSERT_ID trick
 //
 // All queries use parameterized SQL (?)  — never string-concat.
 package db
@@ -81,34 +81,27 @@ func Open(ctx context.Context, cfg *config.MySQLConfig) (Handle, error) {
 // string concatenation, which is what keeps SQL injection structurally
 // impossible rather than merely unlikely.
 const (
-	qGetUserByUsername = `SELECT id, password_hash, nickname, avatar_version, avatar_suffix, row_version
+	qGetUserByUsername = `SELECT id, password_hash, nickname, avatar_suffix, row_version
 	                      FROM users WHERE username = ?`
 
-	qGetUserByID = `SELECT id, username, nickname, avatar_version, avatar_suffix, row_version
+	qGetUserByID = `SELECT id, username, nickname, avatar_suffix, row_version
 	                FROM users WHERE id = ?`
 
 	qInsertUser = `INSERT INTO users (username, password_hash, nickname) VALUES (?, ?, ?)`
 
 	// row_version rides LAST_INSERT_ID here because nothing else in this
-	// statement needs it: a nickname update touches no other atomic counter,
-	// so this is the one write path where the trick is free.
+	// statement needs an atomic counter — there is no avatar_version column
+	// competing for MySQL's one LAST_INSERT_ID register per statement (see
+	// model.AvatarRelPath's comment for why that column was removed).
 	qUpdateNickname = `UPDATE users SET nickname = ?, row_version = LAST_INSERT_ID(row_version + 1) WHERE id = ?`
 
-	// row_version here is a plain "+1", not LAST_INSERT_ID: avatar_version
-	// already claims that mechanism (see UpdateAvatar), and MySQL's
-	// LAST_INSERT_ID register holds only one value per statement — the second
-	// call would silently overwrite the first. The relative "+1" is still
-	// atomic and safe under concurrent writers; UpdateAvatar reads the OLD
-	// row_version separately, before this statement, purely for cache
-	// invalidation (see its comment for why that read does not need to be
-	// exact).
-	qUpdateAvatar = `UPDATE users
-	                 SET avatar_version = LAST_INSERT_ID(avatar_version + 1),
-	                     avatar_suffix  = ?,
-	                     row_version    = row_version + 1
-	                 WHERE id = ?`
-
-	qGetRowVersion = `SELECT row_version FROM users WHERE id = ?`
+	// Same trick as qUpdateNickname, for the same reason: with avatar_version
+	// gone, row_version is the only atomic counter this statement touches, so
+	// nothing stops it from using LAST_INSERT_ID directly. UpdateAvatar no
+	// longer needs a pre-read to learn the old row_version the way it once
+	// did when avatar_version and row_version were both competing for that
+	// one register.
+	qUpdateAvatar = `UPDATE users SET avatar_suffix = ?, row_version = LAST_INSERT_ID(row_version + 1) WHERE id = ?`
 )
 
 // GetUserByUsername is the login lookup. It is the only helper that returns the
@@ -120,7 +113,7 @@ func GetUserByUsername(ctx context.Context, h Handle, username string) (*model.U
 	// NULL column to the destination's zero value, so this no longer needs the
 	// sql.NullString round trip the database/sql version used.
 	err := h.QueryRowContext(ctx, qGetUserByUsername, username).
-		Scan(&u.ID, &u.PasswordHash, &u.Nickname, &u.AvatarVersion, &u.AvatarSuffix, &u.RowVersion)
+		Scan(&u.ID, &u.PasswordHash, &u.Nickname, &u.AvatarSuffix, &u.RowVersion)
 	switch {
 	case errors.Is(err, ErrNoRows):
 		return nil, ErrUserNotFound
@@ -138,7 +131,7 @@ func GetUserByID(ctx context.Context, h Handle, id uint64) (*model.User, error) 
 	u := &model.User{}
 
 	err := h.QueryRowContext(ctx, qGetUserByID, id).
-		Scan(&u.ID, &u.Username, &u.Nickname, &u.AvatarVersion, &u.AvatarSuffix, &u.RowVersion)
+		Scan(&u.ID, &u.Username, &u.Nickname, &u.AvatarSuffix, &u.RowVersion)
 	switch {
 	case errors.Is(err, ErrNoRows):
 		return nil, ErrUserNotFound
@@ -194,53 +187,42 @@ func UpdateNickname(ctx context.Context, h Handle, id uint64, nickname string) (
 	return uint64(newRowVersion), nil
 }
 
-// UpdateAvatar bumps avatar_version and stores the new filename suffix,
-// returning the version the caller should use when writing the file, plus the
-// row's row_version from just before this update, for cache invalidation.
+// UpdateAvatar stores a new filename suffix and returns the row's new
+// row_version, for the caller to invalidate the cache key the OLD version
+// stamped (system_design.md §4.1).
 //
-// The LAST_INSERT_ID(expr) trick makes avatar_version a single atomic
-// statement: MySQL evaluates avatar_version+1, stashes it in the connection's
-// LAST_INSERT_ID register, and the driver hands it back through LastInsertId.
-// A SELECT followed by an UPDATE would let two concurrent uploads compute the
-// same version and overwrite each other's file.
+// Called AFTER the file at that suffix has already been written to disk —
+// see tcpserver/profile.go:handleUpdateAvatar and model.AvatarRelPath's
+// comment for why the write order changed from the DB-first scheme this once
+// was. There is no avatar_version to bump here any more, which is what makes
+// row_version safe to fetch directly off LAST_INSERT_ID: with only one atomic
+// counter in this statement, nothing else is competing for MySQL's
+// one-per-statement LAST_INSERT_ID register, so unlike the old version of
+// this function there is no need for a separate pre-read.
 //
-// row_version cannot ride the same LAST_INSERT_ID call — MySQL's register
-// holds one value per statement, and avatar_version already claims it — so
-// the OLD row_version is read separately, before the update. That read is
-// intentionally not required to be exact under concurrency: if another upload
-// for the same user commits in between, this call simply invalidates a
-// slightly-stale "old" key, which is either already gone or is about to be
-// deleted by that other upload's own call. Either way nothing is left pointing
-// at a live key, which is all cache invalidation is required to guarantee.
-func UpdateAvatar(ctx context.Context, h Handle, id uint64, suffix string) (newAvatarVersion uint32, oldRowVersion uint64, err error) {
-	err = h.QueryRowContext(ctx, qGetRowVersion, id).Scan(&oldRowVersion)
-	switch {
-	case errors.Is(err, ErrNoRows):
-		return 0, 0, ErrUserNotFound
-	case err != nil:
-		return 0, 0, fmt.Errorf("db: update avatar: read row version: %w", err)
-	}
-
+// RowsAffected is trustworthy for detecting a missing id, the same reasoning
+// UpdateNickname's comment explains it is NOT trustworthy for that on its
+// own: row_version always increments, so a matched row always changes, and 0
+// rows changed can only mean 0 rows matched.
+func UpdateAvatar(ctx context.Context, h Handle, id uint64, suffix string) (newRowVersion uint64, err error) {
 	res, err := h.ExecContext(ctx, qUpdateAvatar, suffix, id)
 	if err != nil {
-		return 0, 0, fmt.Errorf("db: update avatar: %w", err)
+		return 0, fmt.Errorf("db: update avatar: %w", err)
 	}
 
-	// Unlike UpdateNickname, RowsAffected is trustworthy here: the version
-	// always increments, so a matched row always changes. 0 means no such id.
 	n, err := res.RowsAffected()
 	if err != nil {
-		return 0, 0, fmt.Errorf("db: update avatar: rows affected: %w", err)
+		return 0, fmt.Errorf("db: update avatar: rows affected: %w", err)
 	}
 	if n == 0 {
-		return 0, 0, ErrUserNotFound
+		return 0, ErrUserNotFound
 	}
 
-	version, err := res.LastInsertId()
+	newRV, err := res.LastInsertId()
 	if err != nil {
-		return 0, 0, fmt.Errorf("db: update avatar: last insert id: %w", err)
+		return 0, fmt.Errorf("db: update avatar: last insert id: %w", err)
 	}
-	return uint32(version), oldRowVersion, nil
+	return uint64(newRV), nil
 }
 
 // isDuplicateKey reports whether err is a MySQL unique-constraint violation.

@@ -94,9 +94,6 @@ func TestInsertAndGetUserByUsername(t *testing.T) {
 	}
 	// A fresh user has no avatar. avatar_suffix is NULL in MySQL and must
 	// arrive as "" rather than blowing up the scan.
-	if got.AvatarVersion != 0 {
-		t.Errorf("AvatarVersion = %d, want 0", got.AvatarVersion)
-	}
 	if got.AvatarSuffix != "" {
 		t.Errorf("AvatarSuffix = %q, want \"\" for a NULL column", got.AvatarSuffix)
 	}
@@ -206,42 +203,37 @@ func TestUpdateAvatar(t *testing.T) {
 
 	id, _, _ := insertTestUser(t, h, "Avatar")
 
-	v1, oldRV1, err := UpdateAvatar(ctx, h, id, "deadbeef")
+	rv1, err := UpdateAvatar(ctx, h, id, "deadbeef")
 	if err != nil {
 		t.Fatalf("UpdateAvatar: %v", err)
 	}
-	if v1 != 1 {
-		t.Errorf("first version = %d, want 1", v1)
-	}
-	if oldRV1 != 0 {
-		t.Errorf("first old row_version = %d, want 0 (fresh row)", oldRV1)
+	if rv1 != 1 {
+		t.Errorf("first row_version = %d, want 1 (first mutating write on a fresh row)", rv1)
 	}
 
-	v2, oldRV2, err := UpdateAvatar(ctx, h, id, "cafef00d")
+	rv2, err := UpdateAvatar(ctx, h, id, "cafef00d")
 	if err != nil {
 		t.Fatalf("UpdateAvatar: %v", err)
 	}
-	if v2 != 2 {
-		t.Errorf("second version = %d, want 2", v2)
-	}
-	if oldRV2 != 1 {
-		t.Errorf("second old row_version = %d, want 1 (row_version after the first upload)", oldRV2)
+	if rv2 != 2 {
+		t.Errorf("second row_version = %d, want 2", rv2)
 	}
 
 	got, err := GetUserByID(ctx, h, id)
 	if err != nil {
 		t.Fatalf("GetUserByID: %v", err)
 	}
-	if got.AvatarVersion != 2 || got.AvatarSuffix != "cafef00d" {
-		t.Errorf("stored avatar = v%d/%q, want v2/%q", got.AvatarVersion, got.AvatarSuffix, "cafef00d")
+	// Only the suffix identifies the current avatar now; the second upload's
+	// suffix must have overwritten the first's, with no version column to
+	// check.
+	if got.AvatarSuffix != "cafef00d" {
+		t.Errorf("stored avatar suffix = %q, want %q", got.AvatarSuffix, "cafef00d")
 	}
-	// row_version bumps alongside avatar_version, not instead of it — both
-	// uploads mutated the row, so after two uploads it must read 2.
 	if got.RowVersion != 2 {
 		t.Errorf("stored row_version = %d, want 2 after two uploads", got.RowVersion)
 	}
 
-	wantURL := fmt.Sprintf("/uploads/%d/%d/%d_v2_cafef00d.jpg", id>>14, id, id)
+	wantURL := fmt.Sprintf("/uploads/%d/%d/%d_cafef00d.jpg", id>>14, id, id)
 	if got.AvatarURL() != wantURL {
 		t.Errorf("AvatarURL() = %q, want %q", got.AvatarURL(), wantURL)
 	}
@@ -250,23 +242,30 @@ func TestUpdateAvatar(t *testing.T) {
 func TestUpdateAvatarUnknownUser(t *testing.T) {
 	h := testHandle(t)
 
-	if _, _, err := UpdateAvatar(context.Background(), h, 1<<62, "deadbeef"); !errors.Is(err, ErrUserNotFound) {
+	if _, err := UpdateAvatar(context.Background(), h, 1<<62, "deadbeef"); !errors.Is(err, ErrUserNotFound) {
 		t.Errorf("UpdateAvatar error = %v, want ErrUserNotFound", err)
 	}
 }
 
-// TestUpdateAvatarIsAtomic is the test that justifies the LAST_INSERT_ID trick.
-// A SELECT-then-UPDATE implementation passes every other test in this file and
-// fails this one: concurrent uploads would read the same version, return it
-// twice, and the second file write would clobber the first.
-func TestUpdateAvatarIsAtomic(t *testing.T) {
+// TestUpdateAvatarRowVersionIsAtomic is what justifies the LAST_INSERT_ID
+// trick now that avatar_version is gone and row_version is the only counter
+// left in this statement: a SELECT-then-UPDATE implementation would let
+// concurrent uploads read the same row_version and hand out duplicates,
+// which breaks the invalidation scheme in §4.1 (two uploads would both
+// believe they are invalidating the same "old" key, and the actually-current
+// key from whichever won would never get a distinct one to be invalidated
+// from later). Uniqueness of the FILE, unlike in the old avatar_version
+// scheme, no longer depends on this at all — that now rests entirely on the
+// random suffix never repeating for the same user, which this test does not
+// need to (and cannot usefully) check.
+func TestUpdateAvatarRowVersionIsAtomic(t *testing.T) {
 	h := testHandle(t)
 	ctx := context.Background()
 
 	id, _, _ := insertTestUser(t, h, "Concurrent")
 
 	const n = 16
-	versions := make([]uint32, n)
+	rowVersions := make([]uint64, n)
 	errs := make([]error, n)
 
 	var wg sync.WaitGroup
@@ -274,30 +273,24 @@ func TestUpdateAvatarIsAtomic(t *testing.T) {
 	for i := range n {
 		go func() {
 			defer wg.Done()
-			// oldRowVersion is deliberately not asserted here: under this much
-			// concurrency, which goroutine's pre-read runs when is exactly the
-			// "not required to be exact" slack the function's own comment
-			// documents. avatar_version is the one that must be a clean,
-			// collision-free sequence, because a real duplicate there would
-			// mean two uploads wrote the same file.
-			versions[i], _, errs[i] = UpdateAvatar(ctx, h, id, fmt.Sprintf("%08x", i))
+			rowVersions[i], errs[i] = UpdateAvatar(ctx, h, id, fmt.Sprintf("%08x", i))
 		}()
 	}
 	wg.Wait()
 
-	seen := make(map[uint32]bool, n)
+	seen := make(map[uint64]bool, n)
 	for i, err := range errs {
 		if err != nil {
 			t.Fatalf("UpdateAvatar #%d: %v", i, err)
 		}
-		if seen[versions[i]] {
-			t.Errorf("version %d handed out more than once", versions[i])
+		if seen[rowVersions[i]] {
+			t.Errorf("row_version %d handed out more than once", rowVersions[i])
 		}
-		seen[versions[i]] = true
+		seen[rowVersions[i]] = true
 	}
-	for want := uint32(1); want <= n; want++ {
+	for want := uint64(1); want <= n; want++ {
 		if !seen[want] {
-			t.Errorf("version %d was never returned; versions are not a clean sequence", want)
+			t.Errorf("row_version %d was never returned; row_versions are not a clean sequence", want)
 		}
 	}
 }

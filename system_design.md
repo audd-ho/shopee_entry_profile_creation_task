@@ -187,7 +187,7 @@ Delete-on-write is race-safe (deleting is idempotent; next read refetches fresh)
   - per row versioning
     - the inverse of the above actually, so this is preferred here for the DB
 
-**Implementation note (resolved in §4.4.4):** the per-row version above is a dedicated `row_version` column, separate from `avatar_version` (§4.4). `avatar_version` only bumps on avatar upload and is embedded in the served file's name; `row_version` bumps on *any* mutating write (nickname or avatar) and is embedded only in Redis keys (`user:<username>:v<row_version>`, `profile:<user_id>:v<row_version>`). Conflating the two would make a nickname-only edit point avatar URLs at a version whose file was never written — see §4.4.4 point 4 for the full race analysis.
+**Implementation note (resolved in §4.4.4):** the per-row version above is a dedicated `row_version` column. It was originally kept separate from an `avatar_version` column (§4.4) for exactly the reason below — but `avatar_version` was later removed entirely (§4.4.4 point 3a), so today `row_version` is simply the only version counter in the schema. `row_version` bumps on *any* mutating write (nickname or avatar) and is embedded only in the `profile:<user_id>:v<row_version>` Redis key — **not** `user:<username>`, which is deliberately left unversioned (see §5's Redis key table for why). The historical reasoning for keeping the two counters separate, back when both existed: conflating them would have made a nickname-only edit bump `avatar_version` too, pointing avatar URLs at a version whose file was never written — see §4.4.4 point 4 for the full race analysis, which remains accurate as a record of why that design used two counters, even though only one exists now.
 
 ---
 
@@ -272,10 +272,10 @@ Delete-on-write is race-safe (deleting is idempotent; next read refetches fresh)
 **Decision: Filesystem, path in MySQL.**
 
 **Sub-decisions:**
-- **Default avatar:** all new users start with `avatar_version = 0` and `avatar_suffix = NULL`. Server serves a shared `default.png` (static asset, not per-user) in this state. Once user uploads, `avatar_version` becomes ≥ 1 and their uploaded file is served instead.
+- **Default avatar:** all new users start with `avatar_suffix = NULL`. Server serves a shared `default.png` (static asset, not per-user) in this state. Once user uploads, `avatar_suffix` becomes non-NULL and their uploaded file is served instead. (An earlier version of this schema gated the same thing on `avatar_version = 0` — see §4.4.4 for why that column was removed.)
 - Max upload size: **2 MB**.
 - Allowed types: jpeg, png, webp — sniff content, don't trust extension (see "Content sniffing" below).
-- Write order: write file first (temp + atomic rename), then update DB row. On crash between the two → orphaned file (harmless, sweeper cleans up). Reverse order would leave DB pointing at nonexistent file (visible breakage).
+- Write order: write file first (temp + atomic rename), then update DB row. On crash between the two → orphaned file (harmless, sweeper cleans up). Reverse order would leave DB pointing at nonexistent file (visible breakage). **This is now the actual, final order** — see §4.4.4 for why an earlier iteration briefly had it backwards, and what changed to make this line true again.
 
 ---
 
@@ -324,28 +324,30 @@ We considered several schemes; each has trade-offs:
 |---|---|---|---|---|---|
 | `<user_id>.jpg` | ❌ | Manual (?v=X query) | Torn write on concurrent upload | ✅ | None |
 | `<user_id>_v<n>.jpg` | ❌ | Automatic (URL changes) | ✅ Different file per upload | ✅ | version int |
-| `<random>.jpg` | ✅ | Automatic | ✅ Different file per upload | ❌ | Full path in DB |
-| **`<user_id>_v<n>_<suffix>.jpg`** | ✅ | Automatic | ✅ Different file per upload | ✅ | version int + suffix |
+| `<user_id>_v<n>_<suffix>.jpg` (tried first, superseded — see §4.4.4) | ✅ | Automatic | ✅ Different file per upload | ✅ | version int + suffix |
+| **`<random>.jpg`, scoped as `<user_id>_<suffix>.jpg` (chosen)** | ✅ | Automatic | ✅ Different file per upload | ✅ (user_id still readable in the name) | suffix only |
 
 **Rejected: plain `<user_id>.jpg` (Option D "naive"):**
 - Concurrent uploads write to the same file → torn writes (half file A, half file B) possible on filesystems.
 - Even with atomic rename, no version = need manual cache-busting via query string.
 - Enumerable, but that's acceptable for a public profile field.
 
-**Rejected: plain random filename:**
-- Solves non-enumerability but requires storing full path in DB (~40-100 bytes/row × 10M = ~1 GB).
-- Loses debuggability (`ls` gives no info about which user owns which file).
+**Rejected: `<user_id>_v<version>_<suffix>.jpg` (tried, then removed — full account in §4.4.4):**
+- Solved non-enumerability, cache-busting, and the FS race, all at once — which is why it was the first real candidate.
+- The version had to come from an atomic MySQL increment, and that requirement is what forced the database write to happen before the file existed. §4.4.4 covers the specific bug that ordering caused and why the fix was to drop the version rather than reorder around it.
 
-**Chosen: `<user_id>_v<version>_<suffix>.<ext>`** — hybrid:
-- **user_id**: readability, per-user grouping
-- **version**: monotonic counter, natural cache-busting (URL changes per upload), atomically incremented in MySQL
-- **suffix**: 8-char random hex (32 bits), makes URLs non-enumerable despite predictable IDs
-- Each upload writes a **different file** → no FS race
-- Only 12 bytes of extra state per user (INT + CHAR(8)) vs storing a full path
+**Rejected: fully random filename with no user_id structure:**
+- Solves non-enumerability but requires storing the full path in the DB (~40-100 bytes/row × 10M ≈ 1 GB) rather than an 8-byte suffix, since nothing in the filename is derivable from anything the row already has.
+- Loses debuggability (`ls` gives no info about which user owns which file). This is what the chosen scheme's `<user_id>_` prefix buys over pure randomness, at no extra cost — the id is already the row's primary key, so prepending it is free.
+
+**Chosen: `<user_id>_<suffix>.jpg`** — user_id for readability and per-user grouping (and for the directory shard, §4.4.3), suffix alone for both non-enumerability and cache-busting:
+- **suffix**: 8-char random hex (32 bits) generated in Go via `crypto/rand`, with **no MySQL round trip to produce it**. That last property is the entire reason this scheme replaced the version-numbered one — see §4.4.4.
+- Each upload writes a **different file** (new random suffix) → no FS race, same guarantee the version number used to provide, now from randomness instead of DB atomicity.
+- Only 8 bytes of extra state per user (`CHAR(8)`) vs storing a full path — actually less than the version-numbered scheme's 12 bytes, since there is no separate version column any more.
 
 **Enumerability discussion:**
 - Server exposes URLs, not the filesystem itself. Filesystem is on the server; nobody can `ls` remotely.
-- BUT: an attacker with a browser can iterate URLs (`/uploads/0/10001/10001_v1_????????.jpg`).
+- BUT: an attacker with a browser can iterate URLs (`/uploads/0/10001/10001_????????.jpg`).
 - Sequential AUTO_INCREMENT IDs are trivially guessable.
 - The 32-bit random suffix defeats iteration attacks (~5 days per user at 10k tries/sec).
 - Bumped to `CHAR(16)` = 64 bits for margin at negligible cost — production would use 16+ hex chars.
@@ -440,21 +442,21 @@ Once we hash across N machines, each machine holds a strided sample of the globa
 
 For our uniform random-access workload the residual locality doesn't produce a measurable win, but the hybrid pattern still adds no cost over pure hash — so it's the strictly better long-term design.
 
-**Final layout:**
+**Final layout** (updated: no version segment — §4.4.4 point 3a removed `avatar_version`; the suffix alone now identifies the file):
 ```
-/uploads/<user_id >> 14>/<user_id>/<user_id>_v<version>_<suffix>.jpg
+/uploads/<user_id >> 14>/<user_id>/<user_id>_<suffix>.jpg
 ```
 
-Example for user_id = 12345, version = 9:
+Example for user_id = 12345:
 ```
 12345 >> 14 = 0
-/uploads/0/12345/12345_v9_a3f8b91c.jpg
+/uploads/0/12345/12345_a3f8b91c.jpg
 ```
 
-Example for user_id = 500000, version = 3:
+Example for user_id = 500000:
 ```
 500000 >> 14 = 30
-/uploads/30/500000/500000_v3_ff11aa22.jpg
+/uploads/30/500000/500000_ff11aa22.jpg
 ```
 
 **Escalation path (both schemes hit the same wall):**
@@ -469,15 +471,15 @@ Example for user_id = 500000, version = 3:
 - Path deterministic from user_id, no need to store bucket separately.
 - At 10B scale we'd add a second sharding level (`/uploads/<bucket1>/<bucket2>/<user_id>/`); not needed for this task.
 
-**Final layout:**
+**Final layout** (updated: no version segment, same reason as above):
 ```
-/uploads/<user_id & 0x1FFF>/<user_id>/<user_id>_v<version>_<suffix>.jpg
+/uploads/<user_id & 0x1FFF>/<user_id>/<user_id>_<suffix>.jpg
 ```
 
-Example for user_id = 12345, version = 9:
+Example for user_id = 12345:
 ```
 12345 & 0x1FFF = 4153
-/uploads/4153/12345/12345_v9_a3f8b91c.jpg
+/uploads/4153/12345/12345_a3f8b91c.jpg
 ```
 
 ---
@@ -495,62 +497,81 @@ Example for user_id = 12345, version = 9:
    - We use both.
 
 3. **Crash between DB update and file write** — DB says v=9 but v=9 file doesn't exist.
-   - **Impact:** client requests broken avatar until next successful upload.
-   - **Mitigation:** none perfect; write file first, then DB update (reverse order gives a "broken but visible" state which is less confusing than "correct DB, missing file").
-   - Rare event; self-heals on next upload.
+   - **Impact:** client requests broken avatar until next successful upload, and — worse than a simple crash — this could also happen on an ordinary, non-crashing failure: the file write itself could fail (disk full, permissions) *after* the DB commit that made `avatar_version = 9` durable, with no way to roll that commit back. The client is told the upload failed, but the row now disagrees: it points at a version whose file was never written.
+   - **This is what motivated removing `avatar_version` entirely — see 3a below**, rather than accepting the mitigation this point originally proposed (reversing the write order within the versioned scheme). The versioned scheme could not simply reverse its order: the version number came from an atomic MySQL increment, so the database step had to run first to produce the number the filename needed.
 
-4. **`row_version` / `avatar_version` conflation race** — §4.1 decided **per-row** cache versioning: a single version number that bumps on *either* nickname update or avatar upload, used to build Redis cache keys (`user:<username>:v<N>`, `profile:<user_id>:v<N>`). `avatar_version` (this section) bumps **only** on avatar upload and is embedded in the served file's **name**, not just a cache key.
+3a. **Why `avatar_version` was removed, not just reordered around (post-implementation decision):**
+   - **The alternative that was NOT taken:** keep `avatar_version`, but restructure the flow as `SELECT current version → compute next version in Go → write file at that version → UPDATE to commit it`. This achieves file-first ordering while keeping a version column, but costs **two MySQL round trips** instead of the single atomic statement, and — more importantly than the extra round trip — **reopens the exact race the atomic `LAST_INSERT_ID` trick existed to close**: two concurrent uploads for the same user could both `SELECT` the same current version, both compute "version + 1", both write a file at that same computed version, and then both `UPDATE`. That is precisely the failure race point 1 above already fixes for the single-statement version; a SELECT-then-UPDATE structure throws that fix away to get file-first ordering, which is a bad trade, not just a slower one.
+   - **The fix taken instead:** delete the `avatar_version` column and identify each upload's file by its random suffix alone. The suffix is already generated in Go via `crypto/rand`, with **no MySQL round trip at all** — nothing to `SELECT`, nothing to reserve, nothing to race over. That is what makes true file-first-then-DB-second ordering possible in a single MySQL statement: `UPDATE users SET avatar_suffix = ?, row_version = LAST_INSERT_ID(row_version + 1) WHERE id = ?`, run *after* the file is already on disk.
+     - **Uniqueness under concurrency without a counter:** two concurrent uploads by the same user still cannot collide, because each independently draws a fresh 32-bit random suffix — the same property a monotonic counter provided, now from randomness instead of DB atomicity. This is the piece that makes dropping the counter *safe*, not just simpler: without it, "no shared filename" would have had no guarantee at all under concurrent uploads.
+   - **What this fixes:** the row can now only ever point at a suffix if the file for that suffix was *already* written successfully — there is no ordering under which MySQL commits before the file exists. A failed `UPDATE` (rare — id vanished, connection dropped) leaves an orphaned file and an **unchanged, still-valid** row; the client is correctly told the upload failed, and the persisted state agrees with that. Point 3's "correct DB, missing file" state is no longer reachable at all, not just less likely.
+   - **What this costs:** the orphan sweeper (see "Orphan cleanup" below) loses the ability to tell which file is current by reading filenames alone — a random suffix carries no ordering information, unlike a version number. It now needs one MySQL read per swept user to learn the authoritative `avatar_suffix`, where the old scheme needed none. This is a real, ongoing cost (a DB read per cleanup pass instead of zero), traded for eliminating a data-corruption bug outright — worth it, but not free.
+   - **The new race this ordering opens up, and its fix:** a file can now legitimately exist on disk *before* the database has been told about it — the normal state during the gap between the rename below landing and the `UPDATE` committing. A sweeper that decides what to keep by asking "does the DB currently point at this file?" would, during exactly that gap, see a brand-new file the DB doesn't yet reference and correctly-but-wrongly conclude it is an orphan. Deleting it there is worse than the bug this reordering fixed, because it needs no crash at all — an ordinary sweep tick landing at an unlucky moment is enough, and at 10M-user scale, anything that *can* happen on a given upload *will* happen periodically. **Fix: any sweeper must skip every file younger than a fixed grace period (`AvatarSweepGracePeriod` in code, 10 minutes), checked via filesystem mtime, before ever consulting the database — unconditionally, regardless of what the DB says.** Ten minutes is two to three orders of magnitude longer than an upload plus its `UPDATE` could plausibly take, so it costs nothing in the common case while closing the race structurally rather than probabilistically. No sweeper exists in the codebase yet; this requirement is recorded here and as a named constant in code specifically so whichever one is written next cannot miss it.
+
+4. **`row_version` / `avatar_version` conflation race (historical — kept as a record of why the two counters were designed separately; `avatar_version` no longer exists, see point 3a):** §4.1 decided **per-row** cache versioning: a single version number that bumps on *either* nickname update or avatar upload, used to build the `profile:<user_id>:v<N>` Redis cache key (`user:<username>` is unversioned — §5). `avatar_version` (this section, when it still existed) bumped **only** on avatar upload and was embedded in the served file's **name**, not just a cache key.
    - **If these were the same column:** a nickname-only update would bump `avatar_version`, and the next avatar URL built from `id + avatar_version + avatar_suffix` would point at `<id>_v<new_version>_<suffix>.jpg` — a file that was never written (only the DB counter moved, no upload happened) → broken avatar image, even though the user never touched their avatar.
    - **Fix:** keep them as two separate columns with two separate write paths:
      - `avatar_version` — bumped only inside the avatar-upload flow (step 2 below). Used only to derive the on-disk filename / URL.
      - `row_version` — bumped on *every* mutating write to the row (nickname update **or** avatar upload). Used only to build Redis cache keys per §4.1. Never appears in a filename or file path.
    - Both use the same atomic `col = col + 1` pattern (MySQL guarantees no interleaving on a single row), so bumping both in the same `UPDATE` statement is one round trip, not two.
 
-**Chosen upload flow (single DB round trip via combined UPDATE):**
+**Chosen upload flow — file first, then a single-statement DB commit (see 3a above for why this order, and why it needed the version column gone to be possible):**
 ```
-1. Generate 8-char random suffix in Go (crypto/rand)
-2. MySQL:
+1. Generate 8-char random suffix in Go (crypto/rand) — no MySQL round trip
+2. Ensure dir exists: /uploads/<user_id >> 14>/<user_id>/  (idempotent MkdirAll)
+3. Write file to <dir>/<user_id>_<suffix>.jpg.tmp
+4. os.Rename(tmp, final) — atomic on POSIX
+   (Steps 1-4 touch no database at all. If anything fails here, nothing in
+   MySQL has been told about this upload, so the row is untouched.)
+5. MySQL:
       UPDATE users
-      SET avatar_version = LAST_INSERT_ID(avatar_version + 1),
-          avatar_suffix  = ?,
-          row_version    = row_version + 1
+      SET avatar_suffix = ?,
+          row_version   = LAST_INSERT_ID(row_version + 1)
       WHERE id = ?
-      → then SELECT LAST_INSERT_ID() to get new_avatar_version
-   (One statement + trivial select — effectively one round trip.)
-3. Ensure dir exists: /uploads/<user_id >> 14>/<user_id>/  (idempotent MkdirAll)
-4. Write file to <dir>/<user_id>_v<new_avatar_version>_<suffix>.jpg.tmp
-5. os.Rename(tmp, final) — atomic on POSIX
-6. Old files become orphans; async sweeper cleans them up periodically.
-7. [separate goroutine, after step 2 commits] DEL user:<username>:v<old_row_version>, DEL profile:<user_id>:v<old_row_version> — per §4.1 delete-on-write.
+      → then SELECT LAST_INSERT_ID() to get new_row_version
+   (One statement, one round trip.)
+6. Old files become orphans; async sweeper cleans them up periodically,
+   subject to the mtime grace period in 3a — no sweeper implemented yet.
+7. [separate goroutine, after step 5 commits] DEL profile:<user_id>:v<old_row_version>,
+   DEL user:<username> — per §4.1 delete-on-write. (Open question, not yet
+   decided: whether `user:<username>` needs to be part of this at all once it
+   no longer caches nickname/avatar data — see §4.1's discussion of trimming
+   that cache to login-only fields. Left as both keys here to match what is
+   actually implemented today.)
 ```
+If step 5 fails, the file written in steps 2-4 is simply an orphan — swept up later, same as any other orphan — and the row is exactly as it was before the request. There is no ordering under which this flow can leave MySQL pointing at a suffix whose file does not exist.
 
 **Nickname update flow, for symmetry (no file involved, so only `row_version` moves):**
 ```
-1. MySQL: UPDATE users SET nickname = ?, row_version = row_version + 1 WHERE id = ?
-2. [separate goroutine] DEL user:<username>:v<old_row_version>, DEL profile:<user_id>:v<old_row_version>
+1. MySQL: UPDATE users SET nickname = ?, row_version = LAST_INSERT_ID(row_version + 1) WHERE id = ?
+   → then SELECT LAST_INSERT_ID() to get new_row_version
+2. [separate goroutine] DEL user:<username>, DEL profile:<user_id>:v<old_row_version>
 ```
+No file is involved, so unlike the avatar flow there was never a version-vs-suffix
+question here — `row_version` is the only atomic counter this statement touches, so it
+can use `LAST_INSERT_ID` directly, same as the avatar flow does now that
+`avatar_version` is gone (§4.4.4, point 3a).
 
-**Why version stays in MySQL, not Redis:**
+**Why `row_version` stays in MySQL, not Redis:**
 - Redis is for ephemeral state (sessions, rate-limit counters). Wiping Redis must not lose user data.
-- Avatar version is a durable property of the user → MySQL only.
+- `row_version` and `avatar_suffix` are durable properties of the user → MySQL only.
 
 **Why store `avatar_suffix` as a separate column (not full path):**
-- Smaller row: 12 bytes (INT + CHAR(8)) vs ~40-100 bytes for full VARCHAR path.
-- At 10M rows → ~500-900 MB saved on the users table → more of the table fits InnoDB buffer pool.
+- Smaller row: 8 bytes (`CHAR(8)`) vs ~40-100 bytes for full VARCHAR path — narrower still than the version-numbered scheme's 12 bytes (`INT` + `CHAR(8)`), now that there is no separate version column.
+- At 10M rows → meaningful savings on the users table → more of the table fits InnoDB buffer pool.
 - Decouples directory layout from data — can change `/uploads/<bucket>/<user_id>/` scheme without touching data.
-- Path is deterministic from `(id, avatar_version, avatar_suffix)` → constructed server-side on each read.
+- Path is deterministic from `(id, avatar_suffix)` → constructed server-side on each read.
 
 **Orphan cleanup:**
-- Inline delete-on-upload would require reading previous suffix (extra round trip or `FOR UPDATE` locking).
-- Chose async sweeper instead: periodic job walks `/uploads/<bucket>/<user_id>/`, keeps only the current `<user_id>_v<avatar_version>_<avatar_suffix>.<ext>` file, deletes the rest.
-- Simpler upload path; orphans harmless (just disk).
-- simple sort of version in the names and keep the latest is easy
+- Inline delete-on-upload would require reading the previous suffix (extra round trip or `FOR UPDATE` locking).
+- Chose async sweeper instead: periodic job walks `/uploads/<bucket>/<user_id>/` and deletes everything that is not the row's current `avatar_suffix` — **with one change from the original plan, forced by point 3a's reordering:** the sweeper can no longer tell which file is current by reading filenames alone (a random suffix carries no ordering, unlike a version number), so it now needs one MySQL read per swept user's `avatar_suffix`, where the version-numbered scheme needed none. It must also skip anything younger than `AvatarSweepGracePeriod` (10 minutes, checked via mtime) **before** consulting the database at all, or it can delete a file that is mid-upload — see point 3a for the exact race this closes. No sweeper is implemented yet; this is the specification for whoever writes it.
+- Simpler, safer upload path in exchange; orphans still harmless (just disk), still cleaned up on the sweeper's next pass.
 
 **Schema updates for §5:**
-- Add `avatar_version INT UNSIGNED NOT NULL DEFAULT 0` (0 = no avatar uploaded)
-- Add `avatar_suffix CHAR(8) NULL` (nullable; NULL when no avatar)
+- ~~Add `avatar_version INT UNSIGNED NOT NULL DEFAULT 0`~~ — **added, then removed** (post-implementation decision, §4.4.4 point 3a): an atomic MySQL-generated version number forced the database write to happen before the file existed, which could leave the row pointing at a version whose file was never written. Replaced by identifying each upload purely by its random `avatar_suffix`, which needs no MySQL round trip to generate and so imposes no ordering constraint on when the DB is updated relative to the file write.
+- Add `avatar_suffix CHAR(8) NULL` (nullable; NULL when no avatar). Now the *sole* signal for whether a user has an avatar — there is no version column to check alongside it.
 - Remove `avatar_path` (path is now derived, not stored)
-- Add `row_version BIGINT UNSIGNED NOT NULL DEFAULT 0` — per §4.1's per-row cache-versioning decision, bumped on nickname update **or** avatar upload; only ever read to build/tear down Redis cache keys, never used in a filename or path.
+- Add `row_version BIGINT UNSIGNED NOT NULL DEFAULT 0` — per §4.1's per-row cache-versioning decision, bumped on nickname update **or** avatar upload; only ever read to build/tear down Redis cache keys, never used in a filename or path. Unaffected by the `avatar_version` removal above — the two counters were already deliberately separate (point 4 above), and dropping one does not touch the other.
 
 ---
 
@@ -939,11 +960,11 @@ db.Query("SELECT id, nickname FROM users WHERE username = ?", username)
 
 **Why:** MySQL prepares are per-connection; caching them saves parse cost on every query. At 3k-20k RPS this is meaningful.
 
-**Common statements to prepare:**
-- `SELECT id, password_hash, nickname, avatar_version, avatar_suffix, row_version FROM users WHERE username = ?`
-- `SELECT id, nickname, avatar_version, avatar_suffix, row_version FROM users WHERE id = ?`
-- `UPDATE users SET nickname = ?, row_version = row_version + 1 WHERE id = ?`
-- `UPDATE users SET avatar_version = LAST_INSERT_ID(avatar_version + 1), avatar_suffix = ?, row_version = row_version + 1 WHERE id = ?`
+**Common statements to prepare** (no `avatar_version` — removed, §4.4.4 point 3a):
+- `SELECT id, password_hash, nickname, avatar_suffix, row_version FROM users WHERE username = ?`
+- `SELECT id, nickname, avatar_suffix, row_version FROM users WHERE id = ?`
+- `UPDATE users SET nickname = ?, row_version = LAST_INSERT_ID(row_version + 1) WHERE id = ?`
+- `UPDATE users SET avatar_suffix = ?, row_version = LAST_INSERT_ID(row_version + 1) WHERE id = ?`
 - `INSERT INTO users (username, password_hash, nickname) VALUES (?, ?, ?)`
 
 **Decision: prepare-on-first-use per connection, cache for connection lifetime.** ✅
@@ -969,7 +990,6 @@ CREATE TABLE users (
   username       VARCHAR(32)  NOT NULL,
   password_hash  VARBINARY(60) NOT NULL,      -- bcrypt output is 60 bytes
   nickname       VARCHAR(128) NOT NULL,       -- 32 runes × up to 4 bytes
-  avatar_version INT UNSIGNED NOT NULL DEFAULT 0,  -- 0 = no avatar uploaded
   avatar_suffix  CHAR(8)      NULL,           -- 8 hex chars (32 bits random); NULL when no avatar
   row_version    BIGINT UNSIGNED NOT NULL DEFAULT 0,  -- bumped on ANY update (nickname or avatar); cache-key versioning only, see §4.1/§4.4.4
   created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -979,24 +999,57 @@ CREATE TABLE users (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 ```
 
+There is no `avatar_version` column. An earlier iteration of this schema had
+one; it was added, then removed once implemented — see §4.4.4 point 3a for
+the full account of why (short version: it forced the database write to
+happen before the file existed, which could leave a row pointing at a file
+that was never written; a random suffix alone needs no MySQL round trip to
+generate, so removing the counter is what let the write order become
+file-first-then-database instead).
+
 **Notes:**
 - `utf8mb4` for full unicode (emojis in nicknames etc.).
 - `utf8mb4_bin` collation → case-sensitive username; use lower-cased username for lookups if we want case-insensitive.
 - Unique index on `username` for O(log n) lookup at 10M rows.
 - `VARBINARY(60)` for bcrypt (fixed size).
-- Avatar path is **derived**, not stored: `/uploads/<id >> 14>/<id>/<id>_v<avatar_version>_<avatar_suffix>.jpg` (see §4.4).
-- Row footprint is ~12 bytes smaller than storing full path — meaningful at 10M rows for buffer pool efficiency.
-- `row_version` is a distinct counter from `avatar_version` (see §4.4.4) — it exists purely to build/tear down Redis cache keys per §4.1's per-row versioning decision, and never appears in an avatar filename.
+- Avatar path is **derived**, not stored: `/uploads/<id >> 14>/<id>/<id>_<avatar_suffix>.jpg` (see §4.4). `avatar_suffix` being NULL is the sole signal for "no avatar" — there is no version to check alongside it.
+- Row footprint is smaller than the version-numbered scheme (one fewer `INT` column) as well as than storing a full path — meaningful at 10M rows for buffer pool efficiency.
+- `row_version` is unrelated to the avatar scheme above, and unaffected by removing `avatar_version` — the two were already deliberately separate counters (§4.4.4 point 4). `row_version` exists purely to build/tear down Redis cache keys per §4.1's per-row versioning decision, and never appears in an avatar filename.
 
 ### Redis keys
 
 | Key | Value | TTL |
 |---|---|---|
-| `sess:<token>` | JSON `{user_id, username, created_at, ip?, last_seen}` | 24h sliding |
-| `user:<username>:v<row_version>` | JSON `{id, password_hash, nickname, avatar_version, avatar_suffix}` | 10 min |
-| `profile:<user_id>:v<row_version>` | JSON `{nickname, avatar_version, avatar_suffix}` | 1 h |
+| `sess:<token>` | JSON `{user_id, username, row_version, created_at, ip?, last_seen}` | 24h sliding |
+| `user:<username>` (NOT versioned — see note below) | JSON `{id, password_hash, nickname, avatar_suffix, row_version}` | 10 min |
+| `profile:<user_id>:v<row_version>` | JSON `{nickname, avatar_suffix}` | 1 h |
 | `rl:login:ip:<ip>` | counter | 5 min |
 | `rl:login:user:<uname>` | counter | 15 min |
+
+**Why `user:<username>` is NOT versioned, unlike `profile:<user_id>`:** a versioned
+key needs the caller to already know which version to ask for *before* forming the
+GET — otherwise caching buys nothing, since learning the version would itself cost
+a lookup. For `profile:<user_id>` that is free: the session record is being read on
+every authenticated request anyway (to resolve identity), so it carries a
+`row_version` hint at near-zero marginal cost. Login has no such source — it is,
+by definition, the *first* touch of Redis for this identity, before any session
+exists — so versioning this key would force either a second Redis round trip or a
+MySQL read on every single login, defeating the cache that matters most for the
+login-RPS targets. `row_version` is still carried inside the *value* here (not the
+key), purely so a cache-hit login can seed the new session's hint accurately rather
+than always seeding 0 and guaranteeing one wasted miss on that session's first
+profile read.
+
+**Open question, not yet decided:** whether `user:<username>` should be trimmed to
+only what login actually needs — `{id, password_hash, row_version}` — dropping
+`nickname` and `avatar_suffix`, which nothing on the login path reads (`/api/me`'s
+`nickname`/`avatar_url` come from `profile:<user_id>`, already fetched separately,
+after login). If trimmed, nickname/avatar edits would no longer need to invalidate
+`user:<username>` at all — only a password change would, since password would be
+the only field left in it that can go stale. That in turn would remove `username`
+from the arguments `InvalidateOnNicknameChange`/`InvalidateOnAvatarChange` need,
+and raises a follow-on question covered below: whether the session record still
+needs to carry `username`, or whether `profile:<user_id>` can supply it instead.
 
 **Why `row_version` is embedded in the key, not the value** (per §4.1): the previous version's key becomes unreachable the instant `row_version` bumps in MySQL, without needing a delete to race against a concurrent read. The delete-on-write goroutine (§4.1, §4.4.4) still deletes the old key so it doesn't linger to TTL, but correctness doesn't depend on that delete winning any race.
 
@@ -1012,26 +1065,28 @@ CREATE TABLE users (
   - Different index keys naturally — username lookup for login, id lookup for profile.
 - **`sess:<token>` and rate-limit keys** are separate concerns (session state, counters); no user data leaks in them.
 
-**Why session stores `username` alongside `user_id`:** [login password hash value uses username as key, other internal uses user_id as key, since username is unique, technically can use it everywhere but user_id is more easy to scale to more things]
+**Why session stores `username` alongside `user_id` (current implementation; see the open question above — this whole rationale is what's under review):**
 
-Every authenticated request must look up the session in Redis for auth (verify token exists, get identity). By storing **both** `user_id` and `username` in the session record, we get both identifiers in one Redis GET. This matters for cache invalidation on profile edits:
+Every authenticated request must look up the session in Redis for auth (verify token exists, get identity). By storing **both** `user_id` and `username` in the session record, we get both identifiers in one Redis GET. As implemented today, this matters for cache invalidation on profile edits:
 
 ```
 Nickname update flow:
-  1. Redis GET sess:<token>  → {user_id: 42, username: "alice", ...}
-  2. MySQL UPDATE users SET nickname = ?, row_version = row_version + 1 WHERE id = 42
-     → old_row_version known from the pre-update read (or SELECT row_version - 1 if not cached in-request)
+  1. Redis GET sess:<token>  → {user_id: 42, username: "alice", row_version: 5, ...}
+  2. MySQL UPDATE users SET nickname = ?, row_version = LAST_INSERT_ID(row_version + 1) WHERE id = 42
+     → new_row_version returned directly (old_row_version = new_row_version - 1; exact, not a guess)
   3. Redis DEL profile:42:v<old_row_version>     (uses user_id from session)
-  4. Redis DEL user:alice:v<old_row_version>     (uses username from session)
+  4. Redis DEL user:alice                        (uses username from session; NOT versioned — see above)
 ```
 
-Without storing username in the session, step 4 would require an extra MySQL query to look up the username. The ~20 extra bytes per session record is negligible; the extra query is not. This is the session-record pulling **double duty** (auth check + identity retrieval for invalidation). See §4.4.4 for why `row_version` is a separate counter from `avatar_version` and why it's the one embedded in these Redis keys.
+Without storing username in the session, step 4 would require an extra MySQL query to look up the username. The ~20 extra bytes per session record is negligible; the extra query is not — *if* step 4 stays as it is. But step 4 only exists because `user:<username>` currently caches `nickname` and `avatar_suffix` alongside the password hash: if it is trimmed to login-only fields (the open question above), a nickname or avatar edit has nothing left in `user:<username>` to invalidate, step 4 disappears entirely, and `username` stops being something invalidation needs from the session — the only remaining consumer would be formatting the API response in `get_user`, which `profile:<user_id>` could supply just as well if `username` were added to that cache's value instead. That would make the session record's job purely "who is this and are they still logged in", with no double duty. Whether that is a net improvement, or just moves the same fact to a different place, is exactly the open question above.
+
+See §4.4.4 for why `row_version` is a separate counter from the (now-removed) `avatar_version` and why it's the one embedded in the `profile:` key.
 
 ### User table: no vertical split
 
 **Single `users` table, all columns together.** Considered vertical partitioning (splitting hot/cold columns into separate tables) but rejected:
-- Row width is ~138 bytes (was ~130 before `row_version` added, §4.1/§4.4.4) → 10M rows still fits comfortably in typical buffer pool (~1.4 GB). The 8-byte `BIGINT` addition doesn't move the needle on this decision.
-- All columns are accessed together on the hot path (login pulls hash + nickname + avatar_* + `row_version` — the latter needed to build the Redis cache key, not just for the row's own data).
+- Row width is ~134 bytes (~130 before `row_version` was added, minus the ~4-byte `avatar_version` `INT` removed in §4.4.4 point 3a) → 10M rows still fits comfortably in typical buffer pool (~1.3-1.4 GB). Neither change moves the needle on this decision.
+- All columns are accessed together on the hot path (login pulls hash + nickname + `avatar_suffix` + `row_version` — the latter needed to build the Redis cache key, not just for the row's own data).
 - Splitting would add JOIN cost on every read for no memory or lock-contention benefit.
 - Query-level column selection (`SELECT` only what you need) already handles per-request data minimization.
 - Vertical partitioning would only pay off with rows >1 KB or clearly bimodal hot/cold access, neither of which applies.
@@ -1054,7 +1109,7 @@ Without storing username in the session, step 4 would require an extra MySQL que
 | GET  | `/uploads/<path>` | Serve avatar (public, unguessable filename via random suffix) | No |
 | GET  | `/default.png` | Default avatar for users who haven't uploaded one (static, shared) | No |
 
-**Note:** avatar URLs are publicly accessible but non-enumerable due to the random suffix in the filename. See §4.4.5 for rationale. The default avatar is a single shared static asset served when `avatar_version = 0`.
+**Note:** avatar URLs are publicly accessible but non-enumerable due to the random suffix in the filename. See §4.4.5 for rationale. The default avatar is a single shared static asset served when `avatar_suffix` is unset (NULL).
 
 ---
 
@@ -1179,9 +1234,10 @@ Beyond RPS/latency, we want to profile the running binary at the process/CPU/mem
 - [ ] TCP protocol connection pool size + timeouts (§4.7)
 - [ ] `SameSite=Lax` vs `Strict` (§4.9)
 - [ ] bcrypt cost — confirm after seeing perf harness behavior (§4.3)
+- [ ] Trim `user:<username>` to login-only fields (`id`, `password_hash`, `row_version`), dropping `nickname`/`avatar_suffix` since nothing on the login path reads them (§5's Redis key table). Follow-on if trimmed: whether nickname/avatar invalidation still needs `user:<username>` at all, and whether the session record still needs to carry `username` or can rely on `profile:<user_id>` for it instead (§5, "Why session stores `username`").
 
 **Resolved:**
-- ✅ Filename scheme + directory sharding (§4.4) — `<user_id>_v<version>_<suffix>.jpg` in `/uploads/<user_id >> 14>/<user_id>/` (fixed-size range partitioning, extends to hybrid pattern on horizontal scaling)
+- ✅ Filename scheme + directory sharding (§4.4) — `<user_id>_<suffix>.jpg` (no version segment — `avatar_version` was tried, then removed post-implementation, §4.4.4 point 3a) in `/uploads/<user_id >> 14>/<user_id>/` (fixed-size range partitioning, extends to hybrid pattern on horizontal scaling)
 - ✅ Avatar URL public with unguessable filename (§4.4.5)
 - ✅ Redis pool via library (`go-redis`), not custom (§4.6.1)
 - ✅ HTTP↔TCP framing: newline-delimited JSON for v1; binary framing shelved (§4.7)

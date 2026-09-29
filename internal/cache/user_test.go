@@ -17,12 +17,11 @@ import (
 
 func sampleUser() *model.UserCached {
 	return &model.UserCached{
-		ID:            42,
-		PasswordHash:  []byte("$2a$10$abcdefghijklmnopqrstuv"),
-		Nickname:      "Alice",
-		AvatarVersion: 3,
-		AvatarSuffix:  "deadbeef",
-		RowVersion:    5,
+		ID:           42,
+		PasswordHash: []byte("$2a$10$abcdefghijklmnopqrstuv"),
+		Nickname:     "Alice",
+		AvatarSuffix: "deadbeef",
+		RowVersion:   5,
 	}
 }
 
@@ -46,7 +45,7 @@ func TestUserCacheRoundTrip(t *testing.T) {
 	if string(got.PasswordHash) != string(sampleUser().PasswordHash) {
 		t.Errorf("password hash = %q, want %q", got.PasswordHash, sampleUser().PasswordHash)
 	}
-	if got.ID != 42 || got.Nickname != "Alice" || got.AvatarVersion != 3 {
+	if got.ID != 42 || got.Nickname != "Alice" || got.AvatarSuffix != "deadbeef" {
 		t.Errorf("round trip lost fields: %+v", got)
 	}
 	// RowVersion must survive too: it is what lets a cache-hit login seed an
@@ -95,7 +94,7 @@ func TestProfileCacheRoundTripAndAvatarURL(t *testing.T) {
 	ctx := context.Background()
 
 	const rowVersion = 5
-	profile := &model.ProfileCached{Nickname: "Alice", AvatarVersion: 3, AvatarSuffix: "deadbeef"}
+	profile := &model.ProfileCached{Nickname: "Alice", AvatarSuffix: "deadbeef"}
 	if err := c.SetProfileCache(ctx, 42, rowVersion, profile); err != nil {
 		t.Fatalf("SetProfileCache: %v", err)
 	}
@@ -106,7 +105,7 @@ func TestProfileCacheRoundTripAndAvatarURL(t *testing.T) {
 	}
 	// The URL is derived from the cached fields, so a hit and a miss must
 	// produce byte-identical output.
-	want := (&model.User{ID: 42, AvatarVersion: 3, AvatarSuffix: "deadbeef"}).AvatarURL()
+	want := (&model.User{ID: 42, AvatarSuffix: "deadbeef"}).AvatarURL()
 	if got.AvatarURL(42) != want {
 		t.Errorf("avatar url = %q, want %q", got.AvatarURL(42), want)
 	}

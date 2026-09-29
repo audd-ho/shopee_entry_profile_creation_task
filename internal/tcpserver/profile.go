@@ -125,14 +125,33 @@ func (s *Server) handleUpdateNickname(ctx context.Context, d *protocol.UpdateNic
 	return &protocol.UpdateNicknameResult{Nickname: nickname}, nil
 }
 
-// handleUpdateAvatar stores a new profile picture and bumps its version.
+// handleUpdateAvatar stores a new profile picture under a fresh random
+// filename suffix.
 //
-// Ordering is deliberate: bump the version in MySQL first, then write the file
-// at the path that version implies. Doing it the other way round would mean a
-// crash between the two steps leaves the row pointing at a file that was never
-// written — a broken image for that user until they upload again. This order
-// fails the other way: an orphaned file nobody references, which costs disk and
-// is swept up later.
+// Ordering is deliberate, and the reverse of what an earlier version of this
+// design used: write the file FIRST, then update the row that points at it.
+// That earlier version bumped an avatar_version column in MySQL before
+// writing the file, because the version came from an atomic DB increment and
+// the filename needed it — which forced DB-first, and meant a crash between
+// the two steps left the row pointing at a version whose file was never
+// written: a broken avatar with no rollback, discovered on the client's next
+// unrelated page load rather than on the upload that caused it. A suffix
+// alone needs no DB round trip to generate (crypto.AvatarSuffix, below), so
+// nothing forces that ordering any more: file-first means a failure at the
+// DB step leaves an orphaned file behind (harmless — nothing points at it)
+// and the row untouched and still valid, which is what "the upload failed"
+// should actually mean to a client that already has a working avatar.
+//
+// This ordering has its own failure mode, not a crash-only one: a file that
+// exists on disk before its row exists in MySQL looks exactly like an orphan
+// to anything that decides what to keep by asking the database. A periodic
+// sweeper built to compare against current DB state — the natural way to
+// write one — could delete this file in the ordinary window between the
+// rename below landing and the UpdateAvatar call below committing, with no
+// crash involved at all. See model.AvatarSweepGracePeriod for the fix any
+// such sweeper must apply (skip anything younger than a fixed age,
+// unconditionally) — there is no sweeper in this codebase yet, so this is a
+// requirement on whoever writes the next one, not a bug in this handler.
 func (s *Server) handleUpdateAvatar(ctx context.Context, d *protocol.UpdateAvatarData) (*protocol.UpdateAvatarResult, error) {
 	session, err := s.resolveSession(ctx, d.Token)
 	if err != nil {
@@ -152,27 +171,25 @@ func (s *Server) handleUpdateAvatar(ctx context.Context, d *protocol.UpdateAvata
 		return nil, protocol.ErrCodeInvalidInput
 	}
 
-	// The suffix makes the path unguessable, so that knowing a user id is not
-	// enough to enumerate avatars, and so a re-upload at the same version (which
-	// cannot happen, but) cannot collide with the previous file.
+	// Generated with no DB round trip — crypto/rand, not a MySQL sequence —
+	// which is exactly what makes writing the file before touching the row
+	// possible. The suffix also makes the path unguessable, so knowing a user
+	// id is not enough to enumerate avatars.
 	suffix, err := crypto.AvatarSuffix()
 	if err != nil {
 		log.Printf("update_avatar: generate suffix: %v", err)
 		return nil, protocol.ErrCodeInternal
 	}
 
-	// NOTE (system_design.md §5 discussion, not yet decided): db.UpdateAvatar
-	// still commits the version bump before the file exists, so a crash
-	// between the two leaves the row pointing at a version whose file was
-	// never written. Dropping avatar_version in favour of a bare random
-	// suffix would let this go file-first/DB-second instead (no atomic
-	// counter to wait on), closing that failure mode — at the cost of a
-	// different one: a file written before its DB row exists looks like an
-	// orphan to anything sweeping by comparing against the DB, so a routine
-	// (not crash-only) sweep tick could delete it out from under the upload
-	// unless the sweeper is given a time-based grace period. Left as-is
-	// pending that decision.
-	newAvatarVersion, oldRowVersion, err := db.UpdateAvatar(ctx, s.db, session.UserID, suffix)
+	if err := s.writeAvatarFile(session.UserID, suffix, raw); err != nil {
+		log.Printf("update_avatar: write file for user %d: %v", session.UserID, err)
+		return nil, protocol.ErrCodeInternal
+	}
+
+	// If this fails, the file just written is an orphan and the row is
+	// untouched — the client is correctly told the upload failed, and unlike
+	// the old DB-first order, nothing in MySQL now disagrees with that.
+	newRowVersion, err := db.UpdateAvatar(ctx, s.db, session.UserID, suffix)
 	switch {
 	case errors.Is(err, db.ErrUserNotFound):
 		return nil, protocol.ErrCodeUnauthorized
@@ -181,34 +198,28 @@ func (s *Server) handleUpdateAvatar(ctx context.Context, d *protocol.UpdateAvata
 		return nil, protocol.ErrCodeInternal
 	}
 
-	if err := s.writeAvatarFile(session.UserID, newAvatarVersion, suffix, raw); err != nil {
-		log.Printf("update_avatar: write file for user %d: %v", session.UserID, err)
-		return nil, protocol.ErrCodeInternal
-	}
-
-	// Asynchronous, same reasoning as handleUpdateNickname. oldRowVersion here
-	// is a best-effort pre-read (see db.UpdateAvatar's comment), not an exact
-	// value the way handleUpdateNickname's is — that is fine, because an
-	// invalidation targeting a slightly-stale "old" key is still harmless.
+	// Asynchronous, same reasoning as handleUpdateNickname. oldRowVersion is
+	// exact here too, now that row_version is the only atomic counter this
+	// statement touches — see db.UpdateAvatar's comment.
+	oldRowVersion := newRowVersion - 1
 	s.invalidateAsync("avatar", func(ctx context.Context) error {
 		return s.cache.InvalidateOnAvatarChange(ctx, session.UserID, oldRowVersion, session.Username)
 	})
 
 	return &protocol.UpdateAvatarResult{
-		AvatarURL: model.AvatarURL(session.UserID, newAvatarVersion, suffix),
-		Version:   newAvatarVersion,
+		AvatarURL: model.AvatarURL(session.UserID, suffix),
 	}, nil
 }
 
-// writeAvatarFile puts the bytes at the path derived from (id, version, suffix).
+// writeAvatarFile puts the bytes at the path derived from (id, suffix).
 //
 // The write is to a temporary name followed by os.Rename, which is atomic on
 // POSIX within a filesystem. Writing in place would let the static file server
 // serve a half-written image to anyone who requests it during the copy. The
 // temp file is created in the destination directory, not /tmp, because rename
 // across filesystems is not atomic and would silently degrade to a copy.
-func (s *Server) writeAvatarFile(userID uint64, version uint32, suffix string, data []byte) error {
-	rel := filepath.FromSlash(model.AvatarRelPath(userID, version, suffix))
+func (s *Server) writeAvatarFile(userID uint64, suffix string, data []byte) error {
+	rel := filepath.FromSlash(model.AvatarRelPath(userID, suffix))
 	full := filepath.Join(s.cfg.Uploads.Root, rel)
 
 	dir := filepath.Dir(full)

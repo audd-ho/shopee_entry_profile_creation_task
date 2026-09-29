@@ -24,20 +24,19 @@ func TestWriteAvatarFileShardsAndWrites(t *testing.T) {
 	s := newFileTestServer(t)
 
 	const (
-		userID  = uint64(1_234_567)
-		version = uint32(4)
-		suffix  = "0f1e2d3c"
+		userID = uint64(1_234_567)
+		suffix = "0f1e2d3c"
 	)
 	data := []byte("\xff\xd8\xff\xe0 pretend jpeg")
 
-	if err := s.writeAvatarFile(userID, version, suffix, data); err != nil {
+	if err := s.writeAvatarFile(userID, suffix, data); err != nil {
 		t.Fatalf("writeAvatarFile: %v", err)
 	}
 
 	// The path must match what model derives, or the URL handed to the browser
 	// points somewhere the file is not.
 	want := filepath.Join(s.cfg.Uploads.Root,
-		filepath.FromSlash(model.AvatarRelPath(userID, version, suffix)))
+		filepath.FromSlash(model.AvatarRelPath(userID, suffix)))
 
 	got, err := os.ReadFile(want)
 	if err != nil {
@@ -57,12 +56,12 @@ func TestWriteAvatarFileShardsAndWrites(t *testing.T) {
 func TestWriteAvatarFileIsWorldReadable(t *testing.T) {
 	s := newFileTestServer(t)
 
-	if err := s.writeAvatarFile(7, 1, "aabbccdd", []byte("x")); err != nil {
+	if err := s.writeAvatarFile(7, "aabbccdd", []byte("x")); err != nil {
 		t.Fatalf("writeAvatarFile: %v", err)
 	}
 
 	path := filepath.Join(s.cfg.Uploads.Root,
-		filepath.FromSlash(model.AvatarRelPath(7, 1, "aabbccdd")))
+		filepath.FromSlash(model.AvatarRelPath(7, "aabbccdd")))
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
@@ -72,32 +71,34 @@ func TestWriteAvatarFileIsWorldReadable(t *testing.T) {
 	}
 }
 
-// A second upload writes a new versioned file and leaves the old one in place.
-// Those orphans are expected: the version bump is what busts browser caches,
-// and a sweeper reclaims the old files later.
-func TestWriteAvatarFileVersionsSideBySide(t *testing.T) {
+// Two uploads for the same user, at two different suffixes, must not collide
+// or overwrite one another — there is no version number keeping them apart
+// any more, only the suffix itself. The first upload's file survives as an
+// orphan once the second lands, exactly as it would have under the old
+// version-numbered scheme; what changed is what keeps the filenames distinct,
+// not whether old files are left behind.
+func TestWriteAvatarFileDistinctSuffixesSideBySide(t *testing.T) {
 	s := newFileTestServer(t)
 
-	if err := s.writeAvatarFile(7, 1, "aaaaaaaa", []byte("v1")); err != nil {
-		t.Fatalf("v1: %v", err)
+	if err := s.writeAvatarFile(7, "aaaaaaaa", []byte("first")); err != nil {
+		t.Fatalf("first: %v", err)
 	}
-	if err := s.writeAvatarFile(7, 2, "bbbbbbbb", []byte("v2")); err != nil {
-		t.Fatalf("v2: %v", err)
+	if err := s.writeAvatarFile(7, "bbbbbbbb", []byte("second")); err != nil {
+		t.Fatalf("second: %v", err)
 	}
 
 	for _, tc := range []struct {
-		version uint32
-		suffix  string
-		want    string
-	}{{1, "aaaaaaaa", "v1"}, {2, "bbbbbbbb", "v2"}} {
+		suffix string
+		want   string
+	}{{"aaaaaaaa", "first"}, {"bbbbbbbb", "second"}} {
 		path := filepath.Join(s.cfg.Uploads.Root,
-			filepath.FromSlash(model.AvatarRelPath(7, tc.version, tc.suffix)))
+			filepath.FromSlash(model.AvatarRelPath(7, tc.suffix)))
 		got, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatalf("read v%d: %v", tc.version, err)
+			t.Fatalf("read %s: %v", tc.suffix, err)
 		}
 		if string(got) != tc.want {
-			t.Errorf("v%d content = %q, want %q", tc.version, got, tc.want)
+			t.Errorf("%s content = %q, want %q", tc.suffix, got, tc.want)
 		}
 	}
 }
@@ -107,7 +108,7 @@ func TestWriteAvatarFileVersionsSideBySide(t *testing.T) {
 func TestWriteAvatarFileLeavesNoTempFiles(t *testing.T) {
 	s := newFileTestServer(t)
 
-	if err := s.writeAvatarFile(7, 1, "aabbccdd", []byte("x")); err != nil {
+	if err := s.writeAvatarFile(7, "aabbccdd", []byte("x")); err != nil {
 		t.Fatalf("writeAvatarFile: %v", err)
 	}
 
