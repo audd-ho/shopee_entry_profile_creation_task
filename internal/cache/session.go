@@ -3,7 +3,7 @@
 // Value shape: JSON {user_id, username, created_at, ip?, last_seen}
 //
 // Functions:
-//   - CreateSession(ctx, userID, rowVersion, username, ip) (token string, err error)
+//   - CreateSession(ctx, userID, rowVersion, ip) (token string, err error)
 //       Generate 32-byte random token (via crypto/random.go)
 //       SETEX sess:<token> {...} 24h
 //   - GetSession(ctx, token) (*model.Session, error)
@@ -46,12 +46,17 @@ func sessionKey(token string) string { return sessionKeyPrefix + token }
 //
 // rowVersion seeds the session's cache-version hint (model.Session.RowVersion)
 // so the very first GetUser call on this session can try the right
-// profile:<user_id>:v<N> key instead of guessing 0. The caller should pass the
-// row_version the row actually had at login time — from a fresh MySQL read on
-// a cache miss, or carried through from model.UserCached on a cache hit —
-// never a hardcoded 0, or every fresh login would eat one guaranteed miss on
-// its first profile read.
-func (c *Client) CreateSession(ctx context.Context, userID, rowVersion uint64, username, ip string) (string, error) {
+// user:<user_id>:v<N> key instead of guessing. The caller is expected to pass
+// a value freshly read from MySQL at login time (see
+// tcpserver/auth.go:lookupUserForLogin) — never a cached, possibly-stale
+// guess, or the property this buys (the first GetUser call is guaranteed to
+// hit) would not hold.
+//
+// username is not stored on the session at all: unlike an earlier version of
+// this design, no invalidation path needs it any more (see
+// cache/invalidate.go), and get_user's own response reads username from
+// model.UserCached instead. See model.AuthCached/UserCached.
+func (c *Client) CreateSession(ctx context.Context, userID, rowVersion uint64, ip string) (string, error) {
 	token, err := crypto.SessionToken()
 	if err != nil {
 		return "", fmt.Errorf("cache: create session: %w", err)
@@ -60,7 +65,6 @@ func (c *Client) CreateSession(ctx context.Context, userID, rowVersion uint64, u
 	now := time.Now().UTC()
 	blob, err := json.Marshal(&model.Session{
 		UserID:     userID,
-		Username:   username,
 		RowVersion: rowVersion,
 		CreatedAt:  now,
 		LastSeen:   now,
@@ -137,7 +141,7 @@ func (c *Client) refresh(ctx context.Context, key string, s *model.Session) {
 }
 
 // RefreshSessionRowVersion corrects a session's cache-version hint after a
-// GetProfileCache guess using it turned out to be stale.
+// GetUserCache guess using it turned out to be stale.
 //
 // A no-op when the hint is already right, which is the common case: this only
 // ever runs on the miss path, right after a MySQL read has supplied the true

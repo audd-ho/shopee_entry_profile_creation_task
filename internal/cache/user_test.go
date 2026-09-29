@@ -11,60 +11,51 @@ import (
 	"entry_profile_creation/internal/model"
 )
 
-// The user and profile caches are exercised against miniredis for the same
+// The auth and user caches are exercised against miniredis for the same
 // reasons the session tests are: no server to install, and a clock that can be
 // fast-forwarded to check TTLs without sleeping for an hour.
 
-func sampleUser() *model.UserCached {
-	return &model.UserCached{
+func sampleAuth() *model.AuthCached {
+	return &model.AuthCached{
 		ID:           42,
 		PasswordHash: []byte("$2a$10$abcdefghijklmnopqrstuv"),
-		Nickname:     "Alice",
-		AvatarSuffix: "deadbeef",
-		RowVersion:   5,
 	}
 }
 
-func TestUserCacheRoundTrip(t *testing.T) {
+func TestAuthCacheRoundTrip(t *testing.T) {
 	c, _ := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	if err := c.SetUserCache(ctx, "alice", sampleUser()); err != nil {
-		t.Fatalf("SetUserCache: %v", err)
+	if err := c.SetAuthCache(ctx, "alice", sampleAuth()); err != nil {
+		t.Fatalf("SetAuthCache: %v", err)
 	}
 
-	got, hit, err := c.GetUserCache(ctx, "alice")
+	got, hit, err := c.GetAuthCache(ctx, "alice")
 	if err != nil {
-		t.Fatalf("GetUserCache: %v", err)
+		t.Fatalf("GetAuthCache: %v", err)
 	}
 	if !hit {
 		t.Fatal("expected a hit for a key just written")
 	}
 	// The hash in particular must survive the round trip: it is what lets a
 	// cache hit verify a password without touching MySQL.
-	if string(got.PasswordHash) != string(sampleUser().PasswordHash) {
-		t.Errorf("password hash = %q, want %q", got.PasswordHash, sampleUser().PasswordHash)
+	if string(got.PasswordHash) != string(sampleAuth().PasswordHash) {
+		t.Errorf("password hash = %q, want %q", got.PasswordHash, sampleAuth().PasswordHash)
 	}
-	if got.ID != 42 || got.Nickname != "Alice" || got.AvatarSuffix != "deadbeef" {
-		t.Errorf("round trip lost fields: %+v", got)
-	}
-	// RowVersion must survive too: it is what lets a cache-hit login seed an
-	// accurate hint on the new session, instead of always seeding 0 and
-	// eating a guaranteed miss on that session's first profile read.
-	if got.RowVersion != 5 {
-		t.Errorf("RowVersion = %d, want 5", got.RowVersion)
+	if got.ID != 42 {
+		t.Errorf("ID = %d, want 42", got.ID)
 	}
 }
 
 // A miss must be reported as hit=false with a nil error, never as an error.
 // Conflating the two would make an uncached user look like a broken Redis, or
 // worse, like a user that does not exist.
-func TestUserCacheMissIsNotAnError(t *testing.T) {
+func TestAuthCacheMissIsNotAnError(t *testing.T) {
 	c, _ := newTestClient(t, testTTL)
 
-	got, hit, err := c.GetUserCache(context.Background(), "nobody")
+	got, hit, err := c.GetAuthCache(context.Background(), "nobody")
 	if err != nil {
-		t.Fatalf("GetUserCache on a missing key returned an error: %v", err)
+		t.Fatalf("GetAuthCache on a missing key returned an error: %v", err)
 	}
 	if hit || got != nil {
 		t.Errorf("hit = %v, got = %+v; want false, nil", hit, got)
@@ -73,35 +64,38 @@ func TestUserCacheMissIsNotAnError(t *testing.T) {
 
 // A malformed entry is treated as a miss so the caller falls through to MySQL
 // and overwrites it, rather than one bad key breaking a user until it expires.
-func TestUserCacheCorruptEntryReadsAsMiss(t *testing.T) {
+func TestAuthCacheCorruptEntryReadsAsMiss(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 
-	if err := mr.Set(userKey("alice"), "{not json"); err != nil {
+	if err := mr.Set(authKey("alice"), "{not json"); err != nil {
 		t.Fatalf("seed corrupt value: %v", err)
 	}
 
-	_, hit, err := c.GetUserCache(context.Background(), "alice")
+	_, hit, err := c.GetAuthCache(context.Background(), "alice")
 	if err != nil {
-		t.Fatalf("GetUserCache: %v", err)
+		t.Fatalf("GetAuthCache: %v", err)
 	}
 	if hit {
 		t.Error("corrupt entry reported as a hit")
 	}
 }
 
-func TestProfileCacheRoundTripAndAvatarURL(t *testing.T) {
+func TestUserCacheRoundTripAndAvatarURL(t *testing.T) {
 	c, _ := newTestClient(t, testTTL)
 	ctx := context.Background()
 
 	const rowVersion = 5
-	profile := &model.ProfileCached{Nickname: "Alice", AvatarSuffix: "deadbeef"}
-	if err := c.SetProfileCache(ctx, 42, rowVersion, profile); err != nil {
-		t.Fatalf("SetProfileCache: %v", err)
+	user := &model.UserCached{Username: "alice", Nickname: "Alice", AvatarSuffix: "deadbeef"}
+	if err := c.SetUserCache(ctx, 42, rowVersion, user); err != nil {
+		t.Fatalf("SetUserCache: %v", err)
 	}
 
-	got, hit, err := c.GetProfileCache(ctx, 42, rowVersion)
+	got, hit, err := c.GetUserCache(ctx, 42, rowVersion)
 	if err != nil || !hit {
-		t.Fatalf("GetProfileCache: hit=%v err=%v", hit, err)
+		t.Fatalf("GetUserCache: hit=%v err=%v", hit, err)
+	}
+	if got.Username != "alice" || got.Nickname != "Alice" {
+		t.Errorf("round trip lost fields: %+v", got)
 	}
 	// The URL is derived from the cached fields, so a hit and a miss must
 	// produce byte-identical output.
@@ -115,61 +109,62 @@ func TestProfileCacheRoundTripAndAvatarURL(t *testing.T) {
 // invisible to the caller as anything other than an ordinary cache miss, not
 // an error and not stale data. This is what makes the scheme safe even though
 // nothing validates the guess before trying it.
-func TestProfileCacheWrongVersionGuessIsJustAMiss(t *testing.T) {
+func TestUserCacheWrongVersionGuessIsJustAMiss(t *testing.T) {
 	c, _ := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	if err := c.SetProfileCache(ctx, 42, 5, &model.ProfileCached{Nickname: "Alice"}); err != nil {
-		t.Fatalf("SetProfileCache: %v", err)
+	if err := c.SetUserCache(ctx, 42, 5, &model.UserCached{Username: "alice", Nickname: "Alice"}); err != nil {
+		t.Fatalf("SetUserCache: %v", err)
 	}
 
 	// A caller guessing an old, a skipped, or a not-yet-reached version must
 	// all see a plain miss — never the wrong user's data, never an error.
 	for _, guess := range []uint64{0, 4, 6, 999} {
-		if _, hit, err := c.GetProfileCache(ctx, 42, guess); err != nil || hit {
+		if _, hit, err := c.GetUserCache(ctx, 42, guess); err != nil || hit {
 			t.Errorf("guess v%d: hit=%v err=%v, want a clean miss", guess, hit, err)
 		}
 	}
 }
 
-// The two caches are keyed differently on purpose; a profile write must not be
-// readable as a user record or vice versa.
-func TestUserAndProfileKeysDoNotCollide(t *testing.T) {
+// The two caches are keyed differently on purpose; a user record write must
+// not be readable through the auth cache or vice versa.
+func TestAuthAndUserKeysDoNotCollide(t *testing.T) {
 	c, _ := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	if err := c.SetUserCache(ctx, "42", sampleUser()); err != nil {
-		t.Fatalf("SetUserCache: %v", err)
+	if err := c.SetAuthCache(ctx, "42", sampleAuth()); err != nil {
+		t.Fatalf("SetAuthCache: %v", err)
 	}
 
-	if _, hit, _ := c.GetProfileCache(ctx, 42, 5); hit {
-		t.Error("user:42 was readable as profile:42:v5")
+	if _, hit, _ := c.GetUserCache(ctx, 42, 5); hit {
+		t.Error("auth:42 was readable as user:42:v5")
 	}
 }
 
-func TestInvalidateOnNicknameChangeDropsBothKeys(t *testing.T) {
+// Nickname/avatar edits invalidate only user:<user_id>:v<N> now — auth:
+// carries nothing a profile edit could make stale (see model.AuthCached), so
+// it is correctly left untouched, not merely "also dropped for safety".
+func TestInvalidateOnNicknameChangeLeavesAuthAlone(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
 	const oldRowVersion = 5
-	if err := c.SetUserCache(ctx, "alice", sampleUser()); err != nil {
+	if err := c.SetAuthCache(ctx, "alice", sampleAuth()); err != nil {
+		t.Fatalf("SetAuthCache: %v", err)
+	}
+	if err := c.SetUserCache(ctx, 42, oldRowVersion, &model.UserCached{Username: "alice", Nickname: "Alice"}); err != nil {
 		t.Fatalf("SetUserCache: %v", err)
 	}
-	if err := c.SetProfileCache(ctx, 42, oldRowVersion, &model.ProfileCached{Nickname: "Alice"}); err != nil {
-		t.Fatalf("SetProfileCache: %v", err)
-	}
 
-	if err := c.InvalidateOnNicknameChange(ctx, 42, oldRowVersion, "alice"); err != nil {
+	if err := c.InvalidateOnNicknameChange(ctx, 42, oldRowVersion); err != nil {
 		t.Fatalf("InvalidateOnNicknameChange: %v", err)
 	}
 
-	// Both, not just profile:. user: is keyed by username and read by login,
-	// but it carries a nickname copy that would otherwise go stale.
-	if mr.Exists(userKey("alice")) {
-		t.Error("user:alice survived invalidation")
+	if !mr.Exists(authKey("alice")) {
+		t.Error("auth:alice was invalidated by a nickname change; it should not be")
 	}
-	if mr.Exists(profileKey(42, oldRowVersion)) {
-		t.Error("profile:42:v5 survived invalidation")
+	if mr.Exists(userKey(42, oldRowVersion)) {
+		t.Error("user:42:v5 survived invalidation")
 	}
 }
 
@@ -180,34 +175,37 @@ func TestInvalidateIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 
 	for range 2 {
-		if err := c.InvalidateOnAvatarChange(ctx, 999, 3, "ghost"); err != nil {
+		if err := c.InvalidateOnAvatarChange(ctx, 999, 3); err != nil {
 			t.Fatalf("InvalidateOnAvatarChange on absent keys: %v", err)
 		}
 	}
 }
 
-func TestInvalidateOnPasswordChangeSparesProfile(t *testing.T) {
+// Unlike nickname/avatar invalidation, a password change targets auth: —
+// there is no caller for this today (no change-password feature), but the
+// key it deletes must still be the right one.
+func TestInvalidateOnPasswordChangeDropsAuthNotUser(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
 	const rowVersion = 5
-	if err := c.SetUserCache(ctx, "alice", sampleUser()); err != nil {
-		t.Fatalf("SetUserCache: %v", err)
+	if err := c.SetAuthCache(ctx, "alice", sampleAuth()); err != nil {
+		t.Fatalf("SetAuthCache: %v", err)
 	}
-	if err := c.SetProfileCache(ctx, 42, rowVersion, &model.ProfileCached{Nickname: "Alice"}); err != nil {
-		t.Fatalf("SetProfileCache: %v", err)
+	if err := c.SetUserCache(ctx, 42, rowVersion, &model.UserCached{Username: "alice", Nickname: "Alice"}); err != nil {
+		t.Fatalf("SetUserCache: %v", err)
 	}
 
 	if err := c.InvalidateOnPasswordChange(ctx, "alice"); err != nil {
 		t.Fatalf("InvalidateOnPasswordChange: %v", err)
 	}
 
-	if mr.Exists(userKey("alice")) {
-		t.Error("user:alice survived a password change")
+	if mr.Exists(authKey("alice")) {
+		t.Error("auth:alice survived a password change")
 	}
-	// profile: never holds the hash, so dropping it would be pure cache churn.
-	if !mr.Exists(profileKey(42, rowVersion)) {
-		t.Error("profile:42:v5 was dropped by a password change")
+	// user: never holds the hash, so dropping it would be pure cache churn.
+	if !mr.Exists(userKey(42, rowVersion)) {
+		t.Error("user:42:v5 was dropped by a password change")
 	}
 }
 
@@ -224,28 +222,28 @@ func TestUserCacheDisabledAlwaysMisses(t *testing.T) {
 	t.Cleanup(func() { c.Close() })
 	ctx := context.Background()
 
-	if err := c.SetUserCache(ctx, "alice", sampleUser()); err != nil {
-		t.Fatalf("SetUserCache: %v", err)
+	if err := c.SetAuthCache(ctx, "alice", sampleAuth()); err != nil {
+		t.Fatalf("SetAuthCache: %v", err)
 	}
 	// The write must not have happened at all; a key written now would start
 	// serving hits as soon as the flag was flipped back.
-	if mr.Exists(userKey("alice")) {
-		t.Error("disabled cache still wrote user:alice")
+	if mr.Exists(authKey("alice")) {
+		t.Error("disabled cache still wrote auth:alice")
 	}
-	if _, hit, _ := c.GetUserCache(ctx, "alice"); hit {
+	if _, hit, _ := c.GetAuthCache(ctx, "alice"); hit {
 		t.Error("disabled cache reported a hit")
 	}
 
-	if err := c.SetProfileCache(ctx, 42, 5, &model.ProfileCached{Nickname: "Alice"}); err != nil {
-		t.Fatalf("SetProfileCache: %v", err)
+	if err := c.SetUserCache(ctx, 42, 5, &model.UserCached{Username: "alice", Nickname: "Alice"}); err != nil {
+		t.Fatalf("SetUserCache: %v", err)
 	}
-	if _, hit, _ := c.GetProfileCache(ctx, 42, 5); hit {
-		t.Error("disabled profile cache reported a hit")
+	if _, hit, _ := c.GetUserCache(ctx, 42, 5); hit {
+		t.Error("disabled user cache reported a hit")
 	}
 }
 
-// Disabling the user cache must leave sessions working, or a "without cache"
-// run measures the 401 path instead of the uncached one.
+// Disabling the auth/user cache must leave sessions working, or a "without
+// cache" run measures the 401 path instead of the uncached one.
 func TestUserCacheDisabledKeepsSessionsWorking(t *testing.T) {
 	mr := miniredis.RunT(t)
 	c, err := New(&config.RedisConfig{
@@ -257,13 +255,13 @@ func TestUserCacheDisabledKeepsSessionsWorking(t *testing.T) {
 	t.Cleanup(func() { c.Close() })
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, 5, "alice", "203.0.113.7")
+	token, err := c.CreateSession(ctx, 42, 5, "203.0.113.7")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	session, err := c.GetSession(ctx, token)
 	if err != nil {
-		t.Fatalf("GetSession with user cache disabled: %v", err)
+		t.Fatalf("GetSession with cache disabled: %v", err)
 	}
 	if session.UserID != 42 {
 		t.Errorf("user id = %d, want 42", session.UserID)
@@ -276,20 +274,20 @@ func TestCacheTTLs(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	if err := c.SetUserCache(ctx, "alice", sampleUser()); err != nil {
+	if err := c.SetAuthCache(ctx, "alice", sampleAuth()); err != nil {
+		t.Fatalf("SetAuthCache: %v", err)
+	}
+	if err := c.SetUserCache(ctx, 42, 5, &model.UserCached{Username: "alice", Nickname: "Alice"}); err != nil {
 		t.Fatalf("SetUserCache: %v", err)
 	}
-	if err := c.SetProfileCache(ctx, 42, 5, &model.ProfileCached{Nickname: "Alice"}); err != nil {
-		t.Fatalf("SetProfileCache: %v", err)
-	}
 
-	// Just past the 10-minute user TTL, well short of the 1-hour profile TTL.
-	mr.FastForward(userTTL + time.Second)
+	// Just past the 10-minute auth TTL, well short of the 1-hour user TTL.
+	mr.FastForward(authTTL + time.Second)
 
-	if _, hit, _ := c.GetUserCache(ctx, "alice"); hit {
-		t.Errorf("user record outlived its %s TTL", userTTL)
+	if _, hit, _ := c.GetAuthCache(ctx, "alice"); hit {
+		t.Errorf("auth record outlived its %s TTL", authTTL)
 	}
-	if _, hit, _ := c.GetProfileCache(ctx, 42, 5); !hit {
-		t.Errorf("profile record expired before its %s TTL", profileTTL)
+	if _, hit, _ := c.GetUserCache(ctx, 42, 5); !hit {
+		t.Errorf("user record expired before its %s TTL", userTTL)
 	}
 }

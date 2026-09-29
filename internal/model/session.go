@@ -27,17 +27,19 @@ type Session struct {
 
 	UserID uint64 `json:"user_id"`
 
-	// Username is duplicated here so invalidation and audit paths can act on a
-	// session without a round trip to MySQL.
-	Username string `json:"username"`
-
-	// RowVersion is a hint, not a guarantee: the row_version this session's
-	// user had as of the last time this session learned it, either at login
-	// or from a subsequent profile-cache miss. A GetUser call tries
-	// profile:<user_id>:v<RowVersion> first; if the hint is stale the attempt
+	// RowVersion is fetched fresh from MySQL at login (see
+	// tcpserver/auth.go:lookupUserForLogin) — never a stale cache hint — so a
+	// session's first GetUser call always guesses right. Later edits during
+	// the session's lifetime can still make it stale; a GetUser call tries
+	// user:<user_id>:v<RowVersion> first, and if that guess has gone stale it
 	// just misses like any other cache miss, falls through to MySQL, and the
 	// hint gets corrected there (see cache.Client.RefreshSessionRowVersion).
 	// A wrong guess costs one extra miss, never incorrect data.
+	//
+	// Username is deliberately NOT stored here — UserCached (the user: cache)
+	// carries it instead, since get_user has no other reader-side use for a
+	// session field once the two caches are split by purpose (see
+	// model.AuthCached/UserCached).
 	RowVersion uint64 `json:"row_version"`
 
 	CreatedAt time.Time `json:"created_at"`

@@ -89,13 +89,15 @@ func TestInsertAndGetUserByUsername(t *testing.T) {
 	if string(got.PasswordHash) != string(hash) {
 		t.Errorf("PasswordHash = %q, want %q", got.PasswordHash, hash)
 	}
-	if got.Nickname != "Test User" {
-		t.Errorf("Nickname = %q, want %q", got.Nickname, "Test User")
+	// This is the login-path query, trimmed to exactly what login uses (see
+	// its own comment) — nickname and avatar_suffix are deliberately left at
+	// their zero values, not fetched, even though the row itself has a
+	// nickname. GetUserByID is what returns those.
+	if got.Nickname != "" {
+		t.Errorf("Nickname = %q, want \"\" — GetUserByUsername no longer selects it", got.Nickname)
 	}
-	// A fresh user has no avatar. avatar_suffix is NULL in MySQL and must
-	// arrive as "" rather than blowing up the scan.
 	if got.AvatarSuffix != "" {
-		t.Errorf("AvatarSuffix = %q, want \"\" for a NULL column", got.AvatarSuffix)
+		t.Errorf("AvatarSuffix = %q, want \"\" — GetUserByUsername no longer selects it", got.AvatarSuffix)
 	}
 	if got.RowVersion != 0 {
 		t.Errorf("RowVersion = %d, want 0 for a row that has never been updated", got.RowVersion)
@@ -114,6 +116,44 @@ func TestGetUserByID(t *testing.T) {
 	}
 	if got.ID != id || got.Username != username || got.Nickname != "By ID" {
 		t.Errorf("got %+v, want id=%d username=%q nickname=%q", got, id, username, "By ID")
+	}
+}
+
+// TestGetRowVersion covers the login path's auth-cache-HIT case: a fresh,
+// primary-key read of just row_version, with no other columns riding along.
+func TestGetRowVersion(t *testing.T) {
+	h := testHandle(t)
+	ctx := context.Background()
+
+	id, _, _ := insertTestUser(t, h, "Fresh")
+
+	got, err := GetRowVersion(ctx, h, id)
+	if err != nil {
+		t.Fatalf("GetRowVersion: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("row_version = %d, want 0 for a row that has never been updated", got)
+	}
+
+	newRowVersion, err := UpdateNickname(ctx, h, id, "Changed")
+	if err != nil {
+		t.Fatalf("UpdateNickname: %v", err)
+	}
+
+	got, err = GetRowVersion(ctx, h, id)
+	if err != nil {
+		t.Fatalf("GetRowVersion after update: %v", err)
+	}
+	if got != newRowVersion {
+		t.Errorf("row_version = %d, want %d (what UpdateNickname returned)", got, newRowVersion)
+	}
+}
+
+func TestGetRowVersionUnknownUser(t *testing.T) {
+	h := testHandle(t)
+
+	if _, err := GetRowVersion(context.Background(), h, 1<<62); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("GetRowVersion error = %v, want ErrUserNotFound", err)
 	}
 }
 
@@ -185,9 +225,14 @@ func TestUpdateNickname(t *testing.T) {
 		t.Errorf("new row_version = %d, want 1 (first mutating write on a fresh row)", newRowVersion)
 	}
 
-	got, err := GetUserByUsername(ctx, h, username)
+	// GetUserByID, not GetUserByUsername: the latter is trimmed to the
+	// login-only columns and no longer selects nickname at all.
+	got, err := GetUserByID(ctx, h, id)
 	if err != nil {
-		t.Fatalf("GetUserByUsername: %v", err)
+		t.Fatalf("GetUserByID: %v", err)
+	}
+	if got.Username != username {
+		t.Errorf("Username = %q, want %q", got.Username, username)
 	}
 	if got.Nickname != want {
 		t.Errorf("Nickname = %q, want %q", got.Nickname, want)

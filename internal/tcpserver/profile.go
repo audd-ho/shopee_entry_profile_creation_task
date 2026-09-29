@@ -119,7 +119,7 @@ func (s *Server) handleUpdateNickname(ctx context.Context, d *protocol.UpdateNic
 	// so subtracting 1 is not a guess.
 	oldRowVersion := newRowVersion - 1
 	s.invalidateAsync("nickname", func(ctx context.Context) error {
-		return s.cache.InvalidateOnNicknameChange(ctx, session.UserID, oldRowVersion, session.Username)
+		return s.cache.InvalidateOnNicknameChange(ctx, session.UserID, oldRowVersion)
 	})
 
 	return &protocol.UpdateNicknameResult{Nickname: nickname}, nil
@@ -203,7 +203,7 @@ func (s *Server) handleUpdateAvatar(ctx context.Context, d *protocol.UpdateAvata
 	// statement touches — see db.UpdateAvatar's comment.
 	oldRowVersion := newRowVersion - 1
 	s.invalidateAsync("avatar", func(ctx context.Context) error {
-		return s.cache.InvalidateOnAvatarChange(ctx, session.UserID, oldRowVersion, session.Username)
+		return s.cache.InvalidateOnAvatarChange(ctx, session.UserID, oldRowVersion)
 	})
 
 	return &protocol.UpdateAvatarResult{

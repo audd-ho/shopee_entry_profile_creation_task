@@ -36,7 +36,7 @@ func TestSessionSetAndGet(t *testing.T) {
 	c, _ := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, 7, "alice", "203.0.113.7")
+	token, err := c.CreateSession(ctx, 42, 7, "203.0.113.7")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -53,14 +53,13 @@ func TestSessionSetAndGet(t *testing.T) {
 		t.Errorf("UserID = %d, want 42", got.UserID)
 	}
 	// The row_version hint must survive the round trip: it is what lets the
-	// first GetUser call on this session try the right profile: key instead
-	// of guessing 0 and eating a guaranteed miss.
+	// first GetUser call on this session try the right user: key instead of
+	// guessing and eating a miss.
 	if got.RowVersion != 7 {
 		t.Errorf("RowVersion = %d, want 7", got.RowVersion)
 	}
-	if got.Username != "alice" {
-		t.Errorf("Username = %q, want %q", got.Username, "alice")
-	}
+	// Username is deliberately absent from the session record — see
+	// model.Session's comment — so there is nothing to assert about it here.
 	if got.IP != "203.0.113.7" {
 		t.Errorf("IP = %q, want %q", got.IP, "203.0.113.7")
 	}
@@ -81,7 +80,7 @@ func TestSessionTokensAreDistinct(t *testing.T) {
 
 	seen := make(map[string]bool, 100)
 	for range 100 {
-		token, err := c.CreateSession(ctx, 1, 0, "alice", "")
+		token, err := c.CreateSession(ctx, 1, 0, "")
 		if err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}
@@ -99,7 +98,7 @@ func TestSessionStoredValueOmitsToken(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, 0, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 0, "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -123,7 +122,7 @@ func TestRefreshSessionRowVersionUpdatesAndPersists(t *testing.T) {
 	c, _ := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, 3, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 3, "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -141,7 +140,7 @@ func TestRefreshSessionRowVersionUpdatesAndPersists(t *testing.T) {
 	if reread.RowVersion != 9 {
 		t.Errorf("RowVersion after refresh = %d, want 9", reread.RowVersion)
 	}
-	if reread.UserID != 42 || reread.Username != "alice" {
+	if reread.UserID != 42 {
 		t.Errorf("refresh altered unrelated fields: %+v", reread)
 	}
 }
@@ -152,7 +151,7 @@ func TestRefreshSessionRowVersionNoopWhenUnchanged(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, 5, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 5, "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -188,7 +187,7 @@ func TestDeleteSession(t *testing.T) {
 	c, _ := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, 0, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 0, "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -212,7 +211,7 @@ func TestSessionExpires(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, 0, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 0, "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -231,7 +230,7 @@ func TestSlidingWindowHoldsOffEarly(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, 0, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 0, "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -252,7 +251,7 @@ func TestSlidingWindowRefreshesLate(t *testing.T) {
 	c, mr := newTestClient(t, testTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, 0, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 0, "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -274,8 +273,7 @@ func TestSlidingWindowRefreshesLate(t *testing.T) {
 		t.Errorf("LastSeen = %v, want it advanced past %v", second.LastSeen, first.LastSeen)
 	}
 	// The refresh must not disturb anything else in the value.
-	if second.UserID != first.UserID || second.Username != first.Username ||
-		!second.CreatedAt.Equal(first.CreatedAt) {
+	if second.UserID != first.UserID || !second.CreatedAt.Equal(first.CreatedAt) {
 		t.Errorf("refresh altered the session: %+v vs %+v", second, first)
 	}
 }
@@ -293,7 +291,7 @@ func TestSlidingWindowSubSecondPrecision(t *testing.T) {
 	c, mr := newTestClient(t, shortTTL)
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, 0, "alice", "")
+	token, err := c.CreateSession(ctx, 42, 0, "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}

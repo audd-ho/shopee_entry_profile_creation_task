@@ -5,6 +5,7 @@
 // Functions:
 //   - GetUserByUsername(ctx, pool, username) (*model.User, error)
 //   - GetUserByID(ctx, pool, id) (*model.User, error)
+//   - GetRowVersion(ctx, pool, id) (uint64, error)
 //   - InsertUser(ctx, pool, username, passwordHash, nickname) (int64, error)
 //     Handle duplicate-key error → return ErrDuplicateUsername
 //   - UpdateNickname(ctx, pool, id, nickname) (newRowVersion uint64, err error)
@@ -81,11 +82,20 @@ func Open(ctx context.Context, cfg *config.MySQLConfig) (Handle, error) {
 // string concatenation, which is what keeps SQL injection structurally
 // impossible rather than merely unlikely.
 const (
-	qGetUserByUsername = `SELECT id, password_hash, nickname, avatar_suffix, row_version
+	// Trimmed to exactly what login uses: nickname/avatar_suffix used to ride
+	// along here too, back when the login cache carried them. Now that
+	// auth:<username> (model.AuthCached) is login-only, this query is
+	// login-only as well — see GetUserByUsername's own comment.
+	qGetUserByUsername = `SELECT id, password_hash, row_version
 	                      FROM users WHERE username = ?`
 
 	qGetUserByID = `SELECT id, username, nickname, avatar_suffix, row_version
 	                FROM users WHERE id = ?`
+
+	// qGetRowVersion backs the login path's fresh-every-time read (see
+	// GetRowVersion) — used only when the auth cache is a HIT, since a MISS's
+	// qGetUserByUsername above already returns row_version in the same query.
+	qGetRowVersion = `SELECT row_version FROM users WHERE id = ?`
 
 	qInsertUser = `INSERT INTO users (username, password_hash, nickname) VALUES (?, ?, ?)`
 
@@ -104,16 +114,18 @@ const (
 	qUpdateAvatar = `UPDATE users SET avatar_suffix = ?, row_version = LAST_INSERT_ID(row_version + 1) WHERE id = ?`
 )
 
-// GetUserByUsername is the login lookup. It is the only helper that returns the
-// password hash, and the hash must never leave the server.
+// GetUserByUsername is the login-path lookup: the only helper that returns
+// the password hash, which must never leave the server. It backs the auth
+// cache's MISS path only, so it returns exactly what login needs — id,
+// password_hash, row_version — and leaves Nickname/AvatarSuffix on the
+// returned User unset (zero value). Nothing on the login path reads them;
+// callers that need nickname or avatar use GetUserByID instead, after a
+// session exists.
 func GetUserByUsername(ctx context.Context, h Handle, username string) (*model.User, error) {
 	u := &model.User{Username: username}
 
-	// avatar_suffix is NULL until the first upload. The custom scanner maps a
-	// NULL column to the destination's zero value, so this no longer needs the
-	// sql.NullString round trip the database/sql version used.
 	err := h.QueryRowContext(ctx, qGetUserByUsername, username).
-		Scan(&u.ID, &u.PasswordHash, &u.Nickname, &u.AvatarSuffix, &u.RowVersion)
+		Scan(&u.ID, &u.PasswordHash, &u.RowVersion)
 	switch {
 	case errors.Is(err, ErrNoRows):
 		return nil, ErrUserNotFound
@@ -122,6 +134,28 @@ func GetUserByUsername(ctx context.Context, h Handle, username string) (*model.U
 	}
 
 	return u, nil
+}
+
+// GetRowVersion reads a single row's current row_version by primary key.
+//
+// This backs the login path's auth-cache HIT case (see
+// tcpserver/auth.go:lookupUserForLogin): AuthCached does not carry
+// row_version at all (see model.AuthCached's comment), so a hit has nothing
+// to read it from, and this is the deliberate, accepted extra cost of always
+// seeding a session's cache-version hint fresh rather than from a guess. A
+// single indexed SELECT by primary key — cheap, and the only case that pays
+// it, since a MISS already gets row_version for free from
+// GetUserByUsername's own query.
+func GetRowVersion(ctx context.Context, h Handle, id uint64) (uint64, error) {
+	var rowVersion uint64
+	err := h.QueryRowContext(ctx, qGetRowVersion, id).Scan(&rowVersion)
+	switch {
+	case errors.Is(err, ErrNoRows):
+		return 0, ErrUserNotFound
+	case err != nil:
+		return 0, fmt.Errorf("db: get row version: %w", err)
+	}
+	return rowVersion, nil
 }
 
 // GetUserByID backs get_me and profile reads. CreatedAt and UpdatedAt are left

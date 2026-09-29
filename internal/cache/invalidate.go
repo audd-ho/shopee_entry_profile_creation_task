@@ -3,15 +3,14 @@
 // Delete-on-write is race-safe under concurrent writers (deletes are idempotent).
 //
 // Functions:
-//   - InvalidateOnNicknameChange(ctx, userID, oldRowVersion, username) error
-//       DEL profile:<user_id>:v<oldRowVersion>
-//       DEL user:<username>
-//   - InvalidateOnAvatarChange(ctx, userID, oldRowVersion, username) error
-//       DEL profile:<user_id>:v<oldRowVersion>
-//       DEL user:<username>
+//   - InvalidateOnNicknameChange(ctx, userID, oldRowVersion) error
+//       DEL user:<user_id>:v<oldRowVersion>
+//   - InvalidateOnAvatarChange(ctx, userID, oldRowVersion) error
+//       DEL user:<user_id>:v<oldRowVersion>
 //   - InvalidateOnPasswordChange(ctx, username) error
-//       DEL user:<username>
-//       (Future: also invalidate all sessions for that user)
+//       DEL auth:<username>
+//       (No caller today — no change-password feature exists. Kept for when
+//       one is added, rather than deleted; see its own comment.)
 //   - InvalidateSession(ctx, token) error
 //       DEL sess:<token>
 //
@@ -46,38 +45,43 @@ func (c *Client) del(ctx context.Context, what string, keys ...string) error {
 	return nil
 }
 
-// InvalidateOnNicknameChange drops both records that embed the nickname.
+// InvalidateOnNicknameChange drops the record that embeds the nickname.
 //
 // oldRowVersion is the row_version from just before the write that triggered
-// this call — it targets the specific profile:<user_id>:v<N> key that write
-// stamped as stale. The user: key has to go too, not just profile:. It is
-// keyed by username and read by login, but it carries a nickname copy, so
-// leaving it would let a login-path read serve the old display name for up
-// to 10 minutes.
-func (c *Client) InvalidateOnNicknameChange(ctx context.Context, userID, oldRowVersion uint64, username string) error {
-	return c.del(ctx, "nickname", profileKey(userID, oldRowVersion), userKey(username))
+// this call — it targets the specific user:<user_id>:v<N> key that write
+// stamped as stale. auth:<username> is not touched: it no longer carries
+// nickname, avatar, or anything else a profile edit could make stale — see
+// model.AuthCached.
+func (c *Client) InvalidateOnNicknameChange(ctx context.Context, userID, oldRowVersion uint64) error {
+	return c.del(ctx, "nickname", userKey(userID, oldRowVersion))
 }
 
-// InvalidateOnAvatarChange drops both records that embed the avatar version.
+// InvalidateOnAvatarChange drops the record that embeds the avatar suffix.
 //
 // oldRowVersion is the row_version from just before the write, same reasoning
-// as InvalidateOnNicknameChange. Dropping profile: here is belt and braces —
-// the avatar URL is itself versioned, so a stale profile: entry would point at
-// a file that still exists rather than at a broken image — but it is still
-// dropped, because "the upload succeeded but my picture is unchanged" is
-// exactly the bug report this design is meant to make impossible.
-func (c *Client) InvalidateOnAvatarChange(ctx context.Context, userID, oldRowVersion uint64, username string) error {
-	return c.del(ctx, "avatar", profileKey(userID, oldRowVersion), userKey(username))
+// as InvalidateOnNicknameChange. This is belt and braces — the avatar URL is
+// itself versioned by suffix, so a stale user: entry would point at a file
+// that still exists rather than at a broken image — but it is still dropped,
+// because "the upload succeeded but my picture is unchanged" is exactly the
+// bug report this design is meant to make impossible. auth:<username> is not
+// touched, for the same reason as InvalidateOnNicknameChange.
+func (c *Client) InvalidateOnAvatarChange(ctx context.Context, userID, oldRowVersion uint64) error {
+	return c.del(ctx, "avatar", userKey(userID, oldRowVersion))
 }
 
 // InvalidateOnPasswordChange drops the record holding the bcrypt hash.
 //
-// Only user: matters here, since profile: never sees the hash. Note what this
-// does NOT do: existing sessions survive a password change, because sessions
-// are keyed by token and there is no token index per user. Revoking them needs
-// a user:<id> → set-of-tokens index, which is deliberately out of scope.
+// No caller exists today: this service has no change-password feature, so
+// the trigger for this never fires. Kept rather than deleted, since deleting
+// working code for a feature that is merely unimplemented — as opposed to
+// impossible — just means writing it again later; auth:<username> is exactly
+// the key such a feature would need to invalidate, unchanged by everything
+// else in this redesign. Note what this does NOT do: existing sessions
+// survive a password change, because sessions are keyed by token and there is
+// no token index per user. Revoking them needs a user:<id> → set-of-tokens
+// index, which is deliberately out of scope.
 func (c *Client) InvalidateOnPasswordChange(ctx context.Context, username string) error {
-	return c.del(ctx, "password", userKey(username))
+	return c.del(ctx, "password", authKey(username))
 }
 
 // InvalidateSession revokes one session by token. DeleteSession is the same

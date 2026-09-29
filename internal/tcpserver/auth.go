@@ -50,6 +50,7 @@ package tcpserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 
 	"entry_profile_creation/internal/cache"
@@ -126,7 +127,7 @@ func (s *Server) handleLogin(ctx context.Context, d *protocol.LoginData) (*proto
 		return nil, protocol.ErrCodeInternal
 	}
 
-	token, err := s.cache.CreateSession(ctx, user.ID, user.RowVersion, user.Username, d.IP)
+	token, err := s.cache.CreateSession(ctx, user.ID, user.RowVersion, d.IP)
 	if err != nil {
 		log.Printf("login: create session for user %d: %v", user.ID, err)
 		return nil, protocol.ErrCodeInternal
@@ -159,24 +160,23 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 	}
 
 	// The hot path for the whole service: every page load calls this. Serving
-	// it from profile:<user_id>:v<row_version> is what keeps 10M rows from
+	// it from user:<user_id>:v<row_version> is what keeps 10M rows from
 	// turning each one into a primary-key lookup in MySQL.
 	//
-	// session.RowVersion is a hint, not a confirmed value — see model.Session
-	// and cache.profileKey. Trying it costs nothing extra: session was already
-	// being read to resolve identity, so this is zero additional round trips
-	// on the path that matters, and a wrong guess is simply a miss.
-	if profile, hit, cErr := s.cache.GetProfileCache(ctx, session.UserID, session.RowVersion); cErr != nil {
-		log.Printf("get_user: read profile cache for user %d: %v", session.UserID, cErr)
+	// session.RowVersion is fetched fresh at login (see lookupUserForLogin),
+	// so this first attempt after a login is never a blind guess — it only
+	// starts missing later, if an edit happens mid-session. Trying it costs
+	// nothing extra either way: session was already being read to resolve
+	// identity, so this is zero additional round trips on the path that
+	// matters, and a wrong guess is simply a miss.
+	if cached, hit, cErr := s.cache.GetUserCache(ctx, session.UserID, session.RowVersion); cErr != nil {
+		log.Printf("get_user: read user cache for %d: %v", session.UserID, cErr)
 	} else if hit {
 		return &protocol.GetUserResult{
-			UserID: session.UserID,
-			// From the session, not the cached record: the session already
-			// carries it, so storing a second copy would be one more thing to
-			// keep in sync.
-			Username:  session.Username,
-			Nickname:  profile.Nickname,
-			AvatarURL: profile.AvatarURL(session.UserID),
+			UserID:    session.UserID,
+			Username:  cached.Username,
+			Nickname:  cached.Nickname,
+			AvatarURL: cached.AvatarURL(session.UserID),
 		}, nil
 	}
 
@@ -201,8 +201,8 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 		s.cache.RefreshSessionRowVersion(ctx, d.Token, session, user.RowVersion)
 	}
 
-	if cErr := s.cache.SetProfileCache(ctx, user.ID, user.RowVersion, user.CachedProfile()); cErr != nil {
-		log.Printf("get_user: populate profile cache for user %d: %v", user.ID, cErr)
+	if cErr := s.cache.SetUserCache(ctx, user.ID, user.RowVersion, user.CachedUser()); cErr != nil {
+		log.Printf("get_user: populate user cache for %d: %v", user.ID, cErr)
 	}
 
 	return &protocol.GetUserResult{
@@ -214,18 +214,38 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 	}, nil
 }
 
-// lookupUserForLogin resolves a username to a user, through user:<username>.
+// lookupUserForLogin resolves a username to a user, through auth:<username>.
 //
 // Returns db.ErrUserNotFound for an unknown account so the caller's existing
 // switch is unchanged. Note that a miss is NOT cached: storing a negative entry
 // would let anyone fill Redis with keys for usernames that do not exist simply
 // by attempting logins. Unknown usernames therefore always cost a MySQL query,
 // which is acceptable because they also always cost a dummy bcrypt.
+//
+// The returned User's RowVersion is always a fresh read, never a cached
+// value — auth:<username> (model.AuthCached) does not carry row_version at
+// all. On a cache HIT this costs one extra indexed SELECT by primary key
+// (db.GetRowVersion); on a MISS it costs nothing extra, since
+// GetUserByUsername's own query already returns row_version. This is a
+// deliberate trade, made explicitly rather than by default: it guarantees
+// the session this login mints seeds an accurate hint, so the landing page's
+// immediate get_user call is never a guess — at the cost of one guaranteed
+// extra query on the hit path, which is the common case. See
+// model.AuthCached's comment for the full reasoning, and revisit if this
+// measurably affects the login-RPS target.
 func (s *Server) lookupUserForLogin(ctx context.Context, username string) (*model.User, error) {
-	if cached, hit, err := s.cache.GetUserCache(ctx, username); err != nil {
-		log.Printf("login: read user cache for %q: %v", username, err)
+	if cached, hit, err := s.cache.GetAuthCache(ctx, username); err != nil {
+		log.Printf("login: read auth cache for %q: %v", username, err)
 	} else if hit {
-		return cached.User(username), nil
+		user := cached.User(username)
+
+		rowVersion, err := db.GetRowVersion(ctx, s.db, user.ID)
+		if err != nil {
+			return nil, fmt.Errorf("login: read row version for user %d: %w", user.ID, err)
+		}
+		user.RowVersion = rowVersion
+
+		return user, nil
 	}
 
 	user, err := db.GetUserByUsername(ctx, s.db, username)
@@ -237,8 +257,8 @@ func (s *Server) lookupUserForLogin(ctx context.Context, username string) (*mode
 	// function of the row, not of whether this particular attempt succeeded, so
 	// caching it here means a user who fat-fingers their password twice still
 	// only costs one MySQL read.
-	if cErr := s.cache.SetUserCache(ctx, username, user.CachedUser()); cErr != nil {
-		log.Printf("login: populate user cache for %q: %v", username, cErr)
+	if cErr := s.cache.SetAuthCache(ctx, username, user.CachedAuth()); cErr != nil {
+		log.Printf("login: populate auth cache for %q: %v", username, cErr)
 	}
 
 	return user, nil

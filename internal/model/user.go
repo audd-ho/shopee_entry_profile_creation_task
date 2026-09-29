@@ -139,72 +139,84 @@ func AvatarURL(id uint64, suffix string) string {
 // every cache entry.
 // ---------------------------------------------------------------------------
 
-// UserCached is the value stored under user:<username>, serving the login path.
+// AuthCached is the value stored under auth:<username>, serving the login
+// path only. It carries nothing beyond what verifying a password and minting
+// a session need — no nickname, no avatar, and (as of this design) no
+// row_version either. Nickname/avatar live in UserCached instead, fetched
+// separately once a session exists.
 //
-// It includes the bcrypt hash, which is what lets a cache hit verify a password
-// without touching MySQL. That is a deliberate trade: the hash is already
-// salted and slow to attack, and Redis is on the same trust boundary as the
-// database. It is still never sent anywhere near a client.
+// It includes the bcrypt hash, which is what lets a cache hit verify a
+// password without touching MySQL. That is a deliberate trade: the hash is
+// already salted and slow to attack, and Redis is on the same trust boundary
+// as the database. It is still never sent anywhere near a client.
 //
-// Unlike profile:<user_id> (see ProfileCached), this key is NOT versioned —
+// row_version is deliberately NOT cached here. An earlier version of this
+// struct carried it as a hint for seeding a new session's cache-version
+// guess, but that hint could only ever be as fresh as the last time this
+// entry was populated — and nothing invalidates auth:<username> on a
+// nickname/avatar edit (there is nothing left in it that a profile edit could
+// make stale), so the hint could go stale for the entirety of its TTL. The
+// login path now reads row_version fresh on every login instead (see
+// tcpserver/auth.go:lookupUserForLogin) — one extra indexed SELECT on an
+// auth-cache hit, none at all on a miss, since the miss-path query already
+// returns it. That trades a small, deliberate, constant cost on login for a
+// session's very first cache-version guess never being wrong, rather than
+// carrying a value here that would just be a guess by another name.
+//
+// Unlike user:<user_id> (see UserCached below), this key is NOT versioned —
 // login has no prior request to seed a version guess from (there is no
 // session yet; that is what login creates), so a reader would need either a
 // second Redis round trip or a MySQL read just to learn which versioned key
 // to GET, defeating the point of caching the hot path that matters most.
-// RowVersion is carried in the VALUE instead, purely so a cache-hit login can
-// seed the new session's row-version hint accurately (see cache/session.go),
-// rather than always seeding it at 0 and eating one guaranteed extra miss on
-// that session's first profile read.
-type UserCached struct {
+//
+// ID and PasswordHash are both immutable in this service's current feature
+// set (no change-password endpoint exists), which is why AuthCached needs no
+// invalidation path at all today beyond its TTL — see cache/invalidate.go.
+type AuthCached struct {
 	ID           uint64 `json:"id"`
 	PasswordHash []byte `json:"password_hash"`
-	Nickname     string `json:"nickname"`
-	AvatarSuffix string `json:"avatar_suffix,omitempty"`
-	RowVersion   uint64 `json:"row_version"`
 }
 
-// ProfileCached is the value stored under profile:<user_id>, serving get_user.
-//
-// Username is absent on purpose: the caller already has it from the session, so
-// storing it here would duplicate a field that can then go stale independently.
-type ProfileCached struct {
+// UserCached is the value stored under user:<user_id>:v<row_version>,
+// serving get_user. This is the general per-user record everything AFTER
+// login reads from — nickname, avatar, and (unlike AuthCached) username,
+// since a cache hit here has no session field to fall back on for it.
+type UserCached struct {
+	Username     string `json:"username"`
 	Nickname     string `json:"nickname"`
 	AvatarSuffix string `json:"avatar_suffix,omitempty"`
 }
 
-// CachedUser projects a row into the login cache value.
-func (u *User) CachedUser() *UserCached {
-	return &UserCached{
+// CachedAuth projects a row into the auth cache value.
+func (u *User) CachedAuth() *AuthCached {
+	return &AuthCached{
 		ID:           u.ID,
 		PasswordHash: u.PasswordHash,
-		Nickname:     u.Nickname,
-		AvatarSuffix: u.AvatarSuffix,
-		RowVersion:   u.RowVersion,
 	}
 }
 
-// CachedProfile projects a row into the profile cache value.
-func (u *User) CachedProfile() *ProfileCached {
-	return &ProfileCached{
+// CachedUser projects a row into the user cache value.
+func (u *User) CachedUser() *UserCached {
+	return &UserCached{
+		Username:     u.Username,
 		Nickname:     u.Nickname,
 		AvatarSuffix: u.AvatarSuffix,
 	}
 }
 
-// User rehydrates a full User from a login-cache hit. The username is supplied
-// by the caller because it was the lookup key.
-func (c *UserCached) User(username string) *User {
+// User rehydrates a full User from an auth-cache hit. The username is
+// supplied by the caller because it was the lookup key. RowVersion is left
+// zero — the login path always fills it in separately with a fresh read; see
+// AuthCached's comment for why.
+func (c *AuthCached) User(username string) *User {
 	return &User{
 		ID:           c.ID,
 		Username:     username,
 		PasswordHash: c.PasswordHash,
-		Nickname:     c.Nickname,
-		AvatarSuffix: c.AvatarSuffix,
-		RowVersion:   c.RowVersion,
 	}
 }
 
-// AvatarURL derives the avatar path for a cached profile, given its user id.
-func (p *ProfileCached) AvatarURL(id uint64) string {
-	return AvatarURL(id, p.AvatarSuffix)
+// AvatarURL derives the avatar path for a cached user record, given its id.
+func (c *UserCached) AvatarURL(id uint64) string {
+	return AvatarURL(id, c.AvatarSuffix)
 }
