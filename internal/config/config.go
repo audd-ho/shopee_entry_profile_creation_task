@@ -5,6 +5,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -12,6 +13,8 @@ type Config struct {
 	HTTP    HTTPConfig
 	TCP     TCPConfig
 	MySQL   MySQLConfig
+	Shard   ShardConfig
+	IDGen   IDGenConfig
 	Redis   RedisConfig
 	Uploads UploadsConfig
 	Bcrypt  BcryptConfig
@@ -70,6 +73,19 @@ type BcryptConfig struct {
 	Cost int
 }
 
+type ShardConfig struct {
+	DataShardDSNs   []string
+	LookupShardDSNs []string
+	DataMaxOpen     int           // per-shard pool size; default 10
+	LookupMaxOpen   int           // per-lookup-shard pool size; default 5
+	MaxWait         time.Duration // shared across all shard pools
+	VnodesPerShard  int           // consistent hash ring; default 150
+}
+
+type IDGenConfig struct {
+	MachineID int // 0–1023, from MACHINE_ID env var
+}
+
 type SessionConfig struct {
 	TTL time.Duration // 24h
 }
@@ -90,6 +106,23 @@ func Load() *Config {
 			DSN:     envStr("MYSQL_DSN", "app:app@tcp(127.0.0.1:3306)/userdb?parseTime=true&charset=utf8mb4"),
 			MaxOpen: envInt("MYSQL_MAX_OPEN", 50),
 			MaxWait: time.Duration(envInt("MYSQL_MAX_WAIT_MS", 200)) * time.Millisecond,
+		},
+		Shard: ShardConfig{
+			DataShardDSNs:   envCSV("DATA_SHARD_DSNS", []string{
+				"app:app@tcp(127.0.0.1:3306)/data_0?parseTime=true&charset=utf8mb4",
+				"app:app@tcp(127.0.0.1:3306)/data_1?parseTime=true&charset=utf8mb4",
+			}),
+			LookupShardDSNs: envCSV("LOOKUP_SHARD_DSNS", []string{
+				"app:app@tcp(127.0.0.1:3306)/lookup_0?parseTime=true&charset=utf8mb4",
+				"app:app@tcp(127.0.0.1:3306)/lookup_1?parseTime=true&charset=utf8mb4",
+			}),
+			DataMaxOpen:    envInt("SHARD_DATA_MAX_OPEN", 10),
+			LookupMaxOpen:  envInt("SHARD_LOOKUP_MAX_OPEN", 5),
+			MaxWait:        time.Duration(envInt("SHARD_MAX_WAIT_MS", 200)) * time.Millisecond,
+			VnodesPerShard: envInt("SHARD_VNODES", 150),
+		},
+		IDGen: IDGenConfig{
+			MachineID: envInt("MACHINE_ID", 0),
 		},
 		Redis: RedisConfig{
 			Addr:     envStr("REDIS_ADDR", "127.0.0.1:6379"),
@@ -127,4 +160,23 @@ func envInt(envKey string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func envCSV(envKey string, fallback []string) []string {
+	v := os.Getenv(envKey)
+	if v == "" {
+		return fallback
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return fallback
+	}
+	return out
 }

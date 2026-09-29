@@ -86,19 +86,43 @@ func (s *Server) handleSignup(ctx context.Context, d *protocol.SignupData) (*pro
 		return nil, protocol.ErrCodeInternal
 	}
 
-	// No SELECT to check availability first. Two concurrent signups for the
-	// same name would both see it free; uk_username is the only real check.
-	id, err := db.InsertUser(ctx, s.db, d.Username, hash, nickname)
-	switch {
-	case errors.Is(err, db.ErrDuplicateUsername):
-		return nil, protocol.ErrCodeDuplicateUsername
-	case err != nil:
+	id, err := s.idgen.Next()
+	if err != nil {
+		log.Printf("signup: generate id: %v", err)
+		return nil, protocol.ErrCodeInternal
+	}
+
+	// Reserve the username globally on the lookup shard FIRST. Two concurrent
+	// signups for the same name both hash to the same lookup shard and the same
+	// PK — one wins, one gets a duplicate key error. No cross-shard coordination.
+	lookupPool := s.db.LookupShardFor(d.Username)
+	if err := db.InsertLookup(ctx, lookupPool, d.Username, id); err != nil {
+		if errors.Is(err, db.ErrDuplicateUsername) {
+			return nil, protocol.ErrCodeDuplicateUsername
+		}
+		log.Printf("signup: insert lookup: %v", err)
+		return nil, protocol.ErrCodeInternal
+	}
+
+	dataPool := s.db.DataShardFor(id)
+	if err := db.InsertUser(ctx, dataPool, id, d.Username, hash, nickname); err != nil {
+		// Rollback the lookup reservation — explicit, not defer, because we only
+		// want this on failure.
+		if delErr := db.DeleteLookup(ctx, lookupPool, d.Username); delErr != nil {
+			log.Printf("signup: rollback lookup for %q: %v", d.Username, delErr)
+		}
 		log.Printf("signup: insert user: %v", err)
 		return nil, protocol.ErrCodeInternal
 	}
 
-	// Signup deliberately does not issue a session; the client logs in next.
-	return &protocol.SignupResult{UserID: uint64(id)}, nil
+	// Background: cache the lookup so the next login skips the MySQL lookup.
+	go func() {
+		if cErr := s.cache.SetLookupCache(context.Background(), d.Username, id); cErr != nil {
+			log.Printf("signup: cache lookup for %q: %v", d.Username, cErr)
+		}
+	}()
+
+	return &protocol.SignupResult{UserID: id}, nil
 }
 
 // handleLogin authenticates and mints a session.
@@ -180,7 +204,8 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 		}, nil
 	}
 
-	user, err := db.GetUserByID(ctx, s.db, session.UserID)
+	dataPool := s.db.DataShardFor(session.UserID)
+	user, err := db.GetUserByID(ctx, dataPool, session.UserID)
 	switch {
 	case errors.Is(err, db.ErrUserNotFound):
 		// The session outlived its user. Revoke it rather than serving 401s
@@ -214,32 +239,35 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 	}, nil
 }
 
-// lookupUserForLogin resolves a username to a user, through auth:<username>.
+// lookupUserForLogin resolves a username to a user, through the lookup shard
+// and auth:<username> cache.
+//
+// The flow has two phases:
+//  1. Lookup phase: resolve username → userID via lookup cache / lookup shard.
+//  2. Auth phase: resolve userID → *User via auth cache / data shard.
 //
 // Returns db.ErrUserNotFound for an unknown account so the caller's existing
 // switch is unchanged. Note that a miss is NOT cached: storing a negative entry
 // would let anyone fill Redis with keys for usernames that do not exist simply
 // by attempting logins. Unknown usernames therefore always cost a MySQL query,
 // which is acceptable because they also always cost a dummy bcrypt.
-//
-// The returned User's RowVersion is always a fresh read, never a cached
-// value — auth:<username> (model.AuthCached) does not carry row_version at
-// all. On a cache HIT this costs one extra indexed SELECT by primary key
-// (db.GetRowVersion); on a MISS it costs nothing extra, since
-// GetUserByUsername's own query already returns row_version. This is a
-// deliberate trade, made explicitly rather than by default: it guarantees
-// the session this login mints seeds an accurate hint, so the landing page's
-// immediate get_user call is never a guess — at the cost of one guaranteed
-// extra query on the hit path, which is the common case. See
-// model.AuthCached's comment for the full reasoning, and revisit if this
-// measurably affects the login-RPS target.
 func (s *Server) lookupUserForLogin(ctx context.Context, username string) (*model.User, error) {
-	if cached, hit, err := s.cache.GetAuthCache(ctx, username); err != nil {
-		log.Printf("login: read auth cache for %q: %v", username, err)
+	// Phase 1: username → userID via lookup cache / lookup shard.
+	userID, err := s.resolveUserID(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+
+	dataPool := s.db.DataShardFor(userID)
+
+	// Phase 2: auth cache → data shard, same as before but routed to the
+	// correct shard pool.
+	if cached, hit, cErr := s.cache.GetAuthCache(ctx, username); cErr != nil {
+		log.Printf("login: read auth cache for %q: %v", username, cErr)
 	} else if hit {
 		user := cached.User(username)
 
-		rowVersion, err := db.GetRowVersion(ctx, s.db, user.ID)
+		rowVersion, err := db.GetRowVersion(ctx, dataPool, user.ID)
 		if err != nil {
 			return nil, fmt.Errorf("login: read row version for user %d: %w", user.ID, err)
 		}
@@ -248,20 +276,37 @@ func (s *Server) lookupUserForLogin(ctx context.Context, username string) (*mode
 		return user, nil
 	}
 
-	user, err := db.GetUserByUsername(ctx, s.db, username)
+	user, err := db.GetUserByUsername(ctx, dataPool, username)
 	if err != nil {
 		return nil, err
 	}
 
-	// Populated before the password is verified, deliberately. The entry is a
-	// function of the row, not of whether this particular attempt succeeded, so
-	// caching it here means a user who fat-fingers their password twice still
-	// only costs one MySQL read.
 	if cErr := s.cache.SetAuthCache(ctx, username, user.CachedAuth()); cErr != nil {
 		log.Printf("login: populate auth cache for %q: %v", username, cErr)
 	}
 
 	return user, nil
+}
+
+// resolveUserID turns a username into a userID, checking the lookup cache
+// first, then falling back to the lookup shard.
+func (s *Server) resolveUserID(ctx context.Context, username string) (uint64, error) {
+	if userID, hit, err := s.cache.GetLookupCache(ctx, username); err != nil {
+		log.Printf("login: read lookup cache for %q: %v", username, err)
+	} else if hit {
+		return userID, nil
+	}
+
+	lookupPool := s.db.LookupShardFor(username)
+	userID, err := db.GetLookup(ctx, lookupPool, username)
+	if err != nil {
+		return 0, err
+	}
+
+	if cErr := s.cache.SetLookupCache(ctx, username, userID); cErr != nil {
+		log.Printf("login: populate lookup cache for %q: %v", username, cErr)
+	}
+	return userID, nil
 }
 
 // resolveSession turns an opaque token into a session, or an error code.

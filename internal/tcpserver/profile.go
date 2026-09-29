@@ -104,7 +104,8 @@ func (s *Server) handleUpdateNickname(ctx context.Context, d *protocol.UpdateNic
 		return nil, protocol.ErrCodeInvalidInput
 	}
 
-	newRowVersion, err := db.UpdateNickname(ctx, s.db, session.UserID, nickname)
+	dataPool := s.db.DataShardFor(session.UserID)
+	newRowVersion, err := db.UpdateNickname(ctx, dataPool, session.UserID, nickname)
 	if err != nil {
 		log.Printf("update_nickname: user %d: %v", session.UserID, err)
 		return nil, protocol.ErrCodeInternal
@@ -189,7 +190,8 @@ func (s *Server) handleUpdateAvatar(ctx context.Context, d *protocol.UpdateAvata
 	// If this fails, the file just written is an orphan and the row is
 	// untouched — the client is correctly told the upload failed, and unlike
 	// the old DB-first order, nothing in MySQL now disagrees with that.
-	newRowVersion, err := db.UpdateAvatar(ctx, s.db, session.UserID, suffix)
+	dataPool := s.db.DataShardFor(session.UserID)
+	newRowVersion, err := db.UpdateAvatar(ctx, dataPool, session.UserID, suffix)
 	switch {
 	case errors.Is(err, db.ErrUserNotFound):
 		return nil, protocol.ErrCodeUnauthorized

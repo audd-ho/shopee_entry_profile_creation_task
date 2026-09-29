@@ -14,21 +14,25 @@ package tcpserver
 
 import (
 	"context"
-	"entry_profile_creation/internal/cache"
-	"entry_profile_creation/internal/config"
-	"entry_profile_creation/internal/db"
 	"log"
 	"net"
 	"sync"
+
+	"entry_profile_creation/internal/cache"
+	"entry_profile_creation/internal/config"
+	"entry_profile_creation/internal/db"
+	"entry_profile_creation/internal/idgen"
 )
 
 type Server struct {
 	cfg *config.Config
 
-	// db is a *sql.DB for now. In phase 4 db.Handle is re-pointed at the custom
-	// pool and nothing in this package changes.
-	db    db.Handle
+	// db holds pools to every data shard and lookup shard, plus the consistent
+	// hash ring for routing. Handlers call db.DataShardFor / db.LookupShardFor
+	// to pick the right pool before calling query helpers.
+	db    *db.ShardedHandle
 	cache *cache.Client
+	idgen *idgen.Generator
 
 	listener net.Listener
 	wg       sync.WaitGroup
@@ -37,8 +41,8 @@ type Server struct {
 // NewServer takes its dependencies rather than building them, so main owns the
 // lifetime of the database and Redis connections and the handlers stay testable
 // against substitutes.
-func NewServer(cfg *config.Config, dbh db.Handle, redis *cache.Client) *Server {
-	return &Server{cfg: cfg, db: dbh, cache: redis}
+func NewServer(cfg *config.Config, dbh *db.ShardedHandle, redis *cache.Client, gen *idgen.Generator) *Server {
+	return &Server{cfg: cfg, db: dbh, cache: redis, idgen: gen}
 }
 
 func (s *Server) Run(ctx context.Context) error {

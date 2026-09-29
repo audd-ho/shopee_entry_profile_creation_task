@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"entry_profile_creation/internal/config"
@@ -45,6 +46,14 @@ func testHandle(t *testing.T) Handle {
 	return h
 }
 
+// testIDCounter generates unique-enough IDs for test rows without a real
+// snowflake generator. Starting high avoids collision with seeded data.
+var testIDCounter atomic.Uint64
+
+func init() { testIDCounter.Store(1 << 40) }
+
+func nextTestID() uint64 { return testIDCounter.Add(1) }
+
 // insertTestUser creates a uniquely named user and schedules its removal, so
 // tests never collide and never leave rows behind.
 func insertTestUser(t *testing.T, h Handle, nickname string) (uint64, string, []byte) {
@@ -57,15 +66,15 @@ func insertTestUser(t *testing.T, h Handle, nickname string) (uint64, string, []
 	username := "test_" + suffix
 	hash := []byte(fmt.Sprintf("$2a$10$fakehashfortesting%s", suffix))
 
-	id, err := InsertUser(context.Background(), h, username, hash, nickname)
-	if err != nil {
+	id := nextTestID()
+	if err := InsertUser(context.Background(), h, id, username, hash, nickname); err != nil {
 		t.Fatalf("InsertUser: %v", err)
 	}
 	t.Cleanup(func() {
 		h.ExecContext(context.Background(), "DELETE FROM users WHERE id = ?", id)
 	})
 
-	return uint64(id), username, hash
+	return id, username, hash
 }
 
 // TestInsertAndGetUserByUsername is the core store-then-query round trip.
@@ -180,7 +189,7 @@ func TestInsertDuplicateUsername(t *testing.T) {
 
 	_, username, hash := insertTestUser(t, h, "First")
 
-	_, err := InsertUser(ctx, h, username, hash, "Second")
+	err := InsertUser(ctx, h, nextTestID(), username, hash, "Second")
 	if !errors.Is(err, ErrDuplicateUsername) {
 		t.Errorf("InsertUser error = %v, want ErrDuplicateUsername", err)
 	}
@@ -197,11 +206,11 @@ func TestUsernameIsCaseSensitive(t *testing.T) {
 	_, username, hash := insertTestUser(t, h, "lower")
 
 	upper := "TEST_" + username[5:]
-	id, err := InsertUser(ctx, h, upper, hash, "upper")
-	if err != nil {
+	upperID := nextTestID()
+	if err := InsertUser(ctx, h, upperID, upper, hash, "upper"); err != nil {
 		t.Fatalf("InsertUser(%q) after %q: %v; the username collation is not binary", upper, username, err)
 	}
-	t.Cleanup(func() { h.ExecContext(ctx, "DELETE FROM users WHERE id = ?", id) })
+	t.Cleanup(func() { h.ExecContext(ctx, "DELETE FROM users WHERE id = ?", upperID) })
 
 	if _, err := GetUserByUsername(ctx, h, upper); err != nil {
 		t.Errorf("GetUserByUsername(%q): %v", upper, err)
