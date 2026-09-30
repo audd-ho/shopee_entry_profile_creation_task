@@ -12,13 +12,13 @@ import (
 // Read executes the lock-stack read path:
 //
 //  1. GET cache — serve immediately on hit (M8: serve-if-exists)
-//  2. Cache miss — Lua check: cache + lock atomically
-//     a. Cache appeared while waiting → serve it
-//     b. Lock held → poll/wait (bounded by MaxReadWait)
-//     c. No cache, no lock → fall through to DB
-//  3. Call dbRead (DB fallback)
-//  4. Version-compare SET to populate cache (M5)
-//  5. Return data + version
+//     A lease value (L:<token>) is treated as a miss.
+//  2. Cache miss — readCheckScript (atomic cache + lock + lease check):
+//     a. HIT: cache populated while we waited → serve it
+//     b. LOCKED: writer in progress → poll with capped exponential backoff
+//     c. LEASED: another reader holds the lease → poll
+//     d. GRANTED: we hold the lease → fresh DB read → leaseSet
+//  3. On max wait exceeded: DB read, return without caching
 //
 // dbRead must return the serialized data and its version number.
 func (ls *LockStack) Read(
@@ -33,84 +33,117 @@ func (ls *LockStack) Read(
 	ck := cacheKeyFor(key)
 	lk := lockKeyFor(key)
 
-	// Step 1 (M8): try a plain GET first — if hit, serve immediately.
+	// Step 1 (M8): plain GET — if real data, serve immediately.
 	raw, err := ls.rdb.Get(ctx, ck).Result()
-	if err == nil {
+	if err == nil && !isLeaseValue(raw) {
 		if data, version, ok := decodeValue(raw); ok {
 			return data, version, nil
 		}
 	}
 	if err != nil && !errors.Is(err, redis.Nil) {
 		log.Printf("lockstack: cache GET failed for %s, falling through to DB: %v", ck, err)
-		return ls.readFromDB(ctx, ck, lk, dbRead)
+		return dbRead(ctx)
 	}
 
-	// Step 2: cache miss — check lock with Lua (atomic cache re-check + lock check).
-	deadline := time.Now().Add(ls.cfg.MaxReadWait)
-	for time.Now().Before(deadline) {
-		result, err := ls.rdb.EvalSha(ctx, ls.readCheckSHA, []string{ck, lk}).Result()
-		if err != nil && !errors.Is(err, redis.Nil) {
-			log.Printf("lockstack: read-check script failed for %s: %v", ck, err)
-			break
+	// Step 2: miss path — readCheck loop with lease grant + capped
+	// exponential backoff (0.5ms → 1 → 2 → 4ms cap, + jitter).
+	token := newLeaseToken()
+	start := time.Now()
+	backoff := ls.cfg.PollMin
+
+	for {
+		res, err := ls.readCheck(ctx, ck, lk, token)
+		if err != nil {
+			log.Printf("lockstack: readCheck failed for %s: %v", ck, err)
+			return dbRead(ctx)
 		}
 
-		switch v := result.(type) {
-		case string:
-			if v == lockedSentinel {
-				select {
-				case <-ctx.Done():
-					return nil, 0, ctx.Err()
-				case <-time.After(ls.cfg.ReadPollInterval):
-				}
-				continue
-			}
-			// Cache was populated while we were waiting — serve it.
-			if data, version, ok := decodeValue(v); ok {
+		switch res.state {
+		case "HIT":
+			if data, version, ok := decodeValue(res.value); ok {
 				return data, version, nil
 			}
+			return dbRead(ctx)
+
+		case "GRANTED":
+			return ls.fetchAndFill(ctx, ck, token, dbRead)
+
+		case "LOCKED", "LEASED":
+			maxWait := ls.cfg.LeaseTTL
+			if res.state == "LOCKED" {
+				maxWait = 2 * ls.cfg.LockTTL
+			}
+			if time.Since(start) > maxWait {
+				return dbRead(ctx)
+			}
+			select {
+			case <-ctx.Done():
+				return nil, 0, ctx.Err()
+			case <-time.After(backoff + jitter(backoff/4)):
+			}
+			backoff = min(backoff*2, ls.cfg.PollMax)
+
+		default:
+			return dbRead(ctx)
 		}
-
-		// nil / false / unparseable → no cache, no lock → fall through to DB.
-		break
 	}
-
-	// Step 3 + 4: DB read, then lock-aware version-compare SET.
-	return ls.readFromDB(ctx, ck, lk, dbRead)
 }
 
-// readFromDB calls the DB fallback, then populates cache using the
-// reader-specific Lua script that checks the lock before writing. If a
-// writer is active, the cache write is skipped (the writer's write-through
-// will handle it). If the version-compare rejects the write (newer version
-// already cached), that's also fine — the data from DB is still correct to
-// serve.
-func (ls *LockStack) readFromDB(
+// readCheckResult holds the parsed response from readCheckCmd.
+type readCheckResult struct {
+	state string // "HIT", "LOCKED", "LEASED", or "GRANTED"
+	value string // cached value (only set when state == "HIT")
+}
+
+// readCheck runs the readCheckCmd Lua script and parses the array result.
+func (ls *LockStack) readCheck(ctx context.Context, cacheKey, lockKey, token string) (readCheckResult, error) {
+	result, err := readCheckCmd.Run(ctx, ls.rdb, []string{cacheKey, lockKey}, token, ls.cfg.LeaseTTL.Milliseconds()).Slice()
+	if err != nil {
+		return readCheckResult{}, err
+	}
+	if len(result) == 0 {
+		return readCheckResult{}, errors.New("lockstack: empty readCheck result")
+	}
+	state, _ := result[0].(string)
+	res := readCheckResult{state: state}
+	if len(result) > 1 {
+		res.value, _ = result[1].(string)
+	}
+	return res, nil
+}
+
+// fetchAndFill reads DB under a granted lease, then populates cache via
+// leaseSetCmd. If the lease was voided (writer DEL'd it), the populate is
+// silently dropped — data is still returned to the caller.
+func (ls *LockStack) fetchAndFill(
 	ctx context.Context,
 	cacheKey string,
-	lockKey string,
-	dbRead func(ctx context.Context) (data []byte, version int64, err error),
+	token string,
+	dbRead func(ctx context.Context) ([]byte, int64, error),
 ) ([]byte, int64, error) {
+	// Release the lease on any exit path. Safe to call after a successful
+	// leaseSet — the slot no longer holds our lease, so it's a no-op.
+	defer ls.releaseLease(cacheKey, token)
+
 	data, version, err := dbRead(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
 
 	encoded := encodeValue(version, data)
-	if setErr := ls.readerVersionSet(ctx, cacheKey, lockKey, version, encoded); setErr != nil {
-		log.Printf("lockstack: cache populate failed for %s: %v", cacheKey, setErr)
+	ttl := cacheTTLSeconds(ls.cfg.CacheTTL)
+	if setErr := leaseSetCmd.Run(ctx, ls.rdb, []string{cacheKey}, token, encoded, ttl).Err(); setErr != nil {
+		log.Printf("lockstack: leaseSet failed for %s: %v", cacheKey, setErr)
 	}
 
 	return data, version, nil
 }
 
-// readerVersionSet runs the lock-aware version-compare-and-SET Lua script.
-// Returns nil even when the write is skipped (lock held) or rejected (newer
-// version exists) — those are normal, not errors.
-func (ls *LockStack) readerVersionSet(ctx context.Context, cacheKey, lockKey string, version int64, encoded string) error {
-	ttl := cacheTTLSeconds(ls.cfg.CacheTTL)
-	_, err := ls.rdb.EvalSha(ctx, ls.readerVersionSetSHA, []string{cacheKey, lockKey}, version, encoded, ttl).Result()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		return err
-	}
-	return nil
+// releaseLease deletes the lease only if it's still ours. Uses background
+// context because this runs in a defer after the request context may have
+// been cancelled.
+func (ls *LockStack) releaseLease(cacheKey, token string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = releaseLeaseCmd.Run(ctx, ls.rdb, []string{cacheKey}, token).Err()
 }

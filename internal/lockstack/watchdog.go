@@ -41,7 +41,7 @@ func (ls *LockStack) startWatchdog(ctx context.Context, lockKey, writerID string
 
 func (ls *LockStack) extendLock(ctx context.Context, lockKey, writerID string) (bool, error) {
 	ttlMs := ls.cfg.LockTTL.Milliseconds()
-	result, err := ls.rdb.EvalSha(ctx, ls.lockExtendSHA, []string{lockKey}, writerID, ttlMs).Int64()
+	result, err := lockExtendCmd.Run(ctx, ls.rdb, []string{lockKey}, writerID, ttlMs).Int64()
 	if err != nil {
 		return false, err
 	}

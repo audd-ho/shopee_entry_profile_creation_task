@@ -55,7 +55,11 @@ func (ls *LockStack) Write(
 	}()
 
 	// Step 3: save current cache value for restoration on DB failure.
+	// A lease value (L:<token>) is not worth restoring.
 	savedValue, _ := ls.rdb.Get(ctx, ck).Bytes()
+	if isLeaseValue(string(savedValue)) {
+		savedValue = nil
+	}
 
 	// Step 4: delete cache BEFORE DB write (M7 delete-first ordering).
 	_ = ls.rdb.Del(ctx, ck).Err()
@@ -85,7 +89,10 @@ func (ls *LockStack) Write(
 
 // acquireLock tries SET NX with TTL, retrying with backoff up to MaxLockRetries.
 func (ls *LockStack) acquireLock(ctx context.Context, lockKey, writerID string) error {
-	backoff := ls.cfg.ReadPollInterval * 5
+	backoff := ls.cfg.LockTTL / time.Duration(ls.cfg.MaxLockRetries)
+	if backoff < time.Millisecond {
+		backoff = time.Millisecond
+	}
 	for i := 0; i <= ls.cfg.MaxLockRetries; i++ {
 		ok, err := ls.rdb.SetNX(ctx, lockKey, writerID, ls.cfg.LockTTL).Result()
 		if err != nil {
@@ -112,8 +119,7 @@ func (ls *LockStack) acquireLock(ctx context.Context, lockKey, writerID string) 
 func (ls *LockStack) releaseLock(lockKey, writerID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_, err := ls.rdb.EvalSha(ctx, ls.lockReleaseSHA, []string{lockKey}, writerID).Result()
-	if err != nil {
+	if err := lockReleaseCmd.Run(ctx, ls.rdb, []string{lockKey}, writerID).Err(); err != nil {
 		log.Printf("lockstack: release lock %s: %v (will expire via TTL)", lockKey, err)
 	}
 }
@@ -121,8 +127,7 @@ func (ls *LockStack) releaseLock(lockKey, writerID string) {
 // versionSet runs the version-compare-and-SET Lua script.
 func (ls *LockStack) versionSet(ctx context.Context, cacheKey string, version int64, encoded string) error {
 	ttl := cacheTTLSeconds(ls.cfg.CacheTTL)
-	_, err := ls.rdb.EvalSha(ctx, ls.versionSetSHA, []string{cacheKey}, version, encoded, ttl).Result()
-	return err
+	return versionSetCmd.Run(ctx, ls.rdb, []string{cacheKey}, version, encoded, ttl).Err()
 }
 
 // degradedWrite skips the lock and runs the DB write directly, then does a
