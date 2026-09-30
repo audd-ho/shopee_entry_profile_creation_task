@@ -118,5 +118,12 @@ func New(cfg *config.RedisConfig, sessionTTL time.Duration) (*Client, error) {
 	}, nil
 }
 
+// RDB exposes the underlying Redis client so the lockstack package can share
+// the same connection pool for lock and cache operations.
+func (c *Client) RDB() *redis.Client { return c.rdb }
+
+// UserCacheDisabled reports whether the user/profile cache is turned off.
+func (c *Client) UserCacheDisabled() bool { return c.userCacheDisabled }
+
 // Close releases the connection pool.
 func (c *Client) Close() error { return c.rdb.Close() }

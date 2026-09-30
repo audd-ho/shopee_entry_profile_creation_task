@@ -42,6 +42,7 @@ package tcpserver
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -96,32 +97,31 @@ func (s *Server) handleUpdateNickname(ctx context.Context, d *protocol.UpdateNic
 		return nil, err
 	}
 
-	// Re-validated here for the same reason signup is: the HTTP server is just
-	// another client of this port, and the cleaned form it returns (control
-	// characters stripped, trimmed) is what gets stored, not the raw input.
 	nickname, err := validate.Nickname(d.Nickname)
 	if err != nil {
 		return nil, protocol.ErrCodeInvalidInput
 	}
 
 	dataPool := s.db.DataShardFor(session.UserID)
-	newRowVersion, err := db.UpdateNickname(ctx, dataPool, session.UserID, nickname)
+	err = s.lockstack.Write(ctx, userCacheKey(session.UserID), func(ctx context.Context) ([]byte, int64, error) {
+		newRV, err := db.UpdateNickname(ctx, dataPool, session.UserID, nickname)
+		if err != nil {
+			return nil, 0, err
+		}
+		user, err := db.GetUserByID(ctx, dataPool, session.UserID)
+		if err != nil {
+			return nil, 0, err
+		}
+		data, err := json.Marshal(user.CachedUser())
+		if err != nil {
+			return nil, 0, err
+		}
+		return data, int64(newRV), nil
+	})
 	if err != nil {
 		log.Printf("update_nickname: user %d: %v", session.UserID, err)
 		return nil, protocol.ErrCodeInternal
 	}
-
-	// After the write, and asynchronous (system_design.md §4.1's
-	// "[separate goroutine]"): the row is already correct in MySQL, so the
-	// client's response does not need to wait on a Redis round trip that
-	// cannot change whether the update succeeded. oldRowVersion is exact here
-	// (unlike UpdateAvatar's pre-read): row_version = row_version + 1 via
-	// LAST_INSERT_ID means newRowVersion is precisely what THIS statement set,
-	// so subtracting 1 is not a guess.
-	oldRowVersion := newRowVersion - 1
-	s.invalidateAsync("nickname", func(ctx context.Context) error {
-		return s.cache.InvalidateOnNicknameChange(ctx, session.UserID, oldRowVersion)
-	})
 
 	return &protocol.UpdateNicknameResult{Nickname: nickname}, nil
 }
@@ -187,11 +187,22 @@ func (s *Server) handleUpdateAvatar(ctx context.Context, d *protocol.UpdateAvata
 		return nil, protocol.ErrCodeInternal
 	}
 
-	// If this fails, the file just written is an orphan and the row is
-	// untouched — the client is correctly told the upload failed, and unlike
-	// the old DB-first order, nothing in MySQL now disagrees with that.
 	dataPool := s.db.DataShardFor(session.UserID)
-	newRowVersion, err := db.UpdateAvatar(ctx, dataPool, session.UserID, suffix)
+	err = s.lockstack.Write(ctx, userCacheKey(session.UserID), func(ctx context.Context) ([]byte, int64, error) {
+		newRV, err := db.UpdateAvatar(ctx, dataPool, session.UserID, suffix)
+		if err != nil {
+			return nil, 0, err
+		}
+		user, err := db.GetUserByID(ctx, dataPool, session.UserID)
+		if err != nil {
+			return nil, 0, err
+		}
+		data, err := json.Marshal(user.CachedUser())
+		if err != nil {
+			return nil, 0, err
+		}
+		return data, int64(newRV), nil
+	})
 	switch {
 	case errors.Is(err, db.ErrUserNotFound):
 		return nil, protocol.ErrCodeUnauthorized
@@ -199,14 +210,6 @@ func (s *Server) handleUpdateAvatar(ctx context.Context, d *protocol.UpdateAvata
 		log.Printf("update_avatar: user %d: %v", session.UserID, err)
 		return nil, protocol.ErrCodeInternal
 	}
-
-	// Asynchronous, same reasoning as handleUpdateNickname. oldRowVersion is
-	// exact here too, now that row_version is the only atomic counter this
-	// statement touches — see db.UpdateAvatar's comment.
-	oldRowVersion := newRowVersion - 1
-	s.invalidateAsync("avatar", func(ctx context.Context) error {
-		return s.cache.InvalidateOnAvatarChange(ctx, session.UserID, oldRowVersion)
-	})
 
 	return &protocol.UpdateAvatarResult{
 		AvatarURL: model.AvatarURL(session.UserID, suffix),

@@ -1,8 +1,9 @@
 // TODO: Configuration loading.
-// Reads config from env vars with sensible defaults.
+// Reads config from .env file and env vars.
 package config
 
 import (
+	"bufio"
 	"os"
 	"strconv"
 	"strings"
@@ -10,35 +11,36 @@ import (
 )
 
 type Config struct {
-	HTTP    HTTPConfig
-	TCP     TCPConfig
-	MySQL   MySQLConfig
-	Shard   ShardConfig
-	IDGen   IDGenConfig
-	Redis   RedisConfig
-	Uploads UploadsConfig
-	Bcrypt  BcryptConfig
-	Session SessionConfig
+	HTTP      HTTPConfig
+	TCP       TCPConfig
+	MySQL     MySQLConfig
+	Shard     ShardConfig
+	IDGen     IDGenConfig
+	Redis     RedisConfig
+	Uploads   UploadsConfig
+	Bcrypt    BcryptConfig
+	Session   SessionConfig
+	LockStack LockStackConfig
 }
 
 type HTTPConfig struct {
-	Addr        string // default ":8080"
-	TCPPoolSize int    // conns to TCP server; default 8
+	Addr        string
+	TCPPoolSize int
 	WebRoot     string
 }
 type TCPConfig struct {
-	Addr string // default ":9000"
+	Addr string
 }
 type MySQLConfig struct {
-	DSN     string        // required, e.g. "user:pass@tcp(host:3306)/db"
-	MaxOpen int           // default 50
-	MaxWait time.Duration // 200ms
+	DSN     string
+	MaxOpen int
+	MaxWait time.Duration
 }
 type RedisConfig struct {
-	Addr     string // default "localhost:6379"
+	Addr     string
 	Password string
 	DB       int
-	PoolSize int // default 50
+	PoolSize int
 
 	// UserCacheDisabled turns off the user:<username> and profile:<user_id>
 	// caches, for the "without cache layer" half of the performance runs.
@@ -52,8 +54,8 @@ type RedisConfig struct {
 	UserCacheDisabled bool
 }
 type UploadsConfig struct {
-	Root     string // default "./uploads"
-	MaxBytes int64  // default 2*1024*1024 (2MB)
+	Root     string
+	MaxBytes int64
 }
 type BcryptConfig struct {
 	// Cost defaults to 5, per system_design.md §4.3/§7: scaled down from the
@@ -76,73 +78,105 @@ type BcryptConfig struct {
 type ShardConfig struct {
 	DataShardDSNs   []string
 	LookupShardDSNs []string
-	DataMaxOpen     int           // per-shard pool size; default 10
-	LookupMaxOpen   int           // per-lookup-shard pool size; default 5
-	MaxWait         time.Duration // shared across all shard pools
-	VnodesPerShard  int           // consistent hash ring; default 150
+	DataMaxOpen     int
+	LookupMaxOpen   int
+	MaxWait         time.Duration
+	VnodesPerShard  int
 }
 
 type IDGenConfig struct {
-	MachineID int // 0–1023, from MACHINE_ID env var
+	MachineID int
 }
 
 type SessionConfig struct {
-	TTL time.Duration // 24h
+	TTL time.Duration
+}
+type LockStackConfig struct {
+	LockTTL  time.Duration // default 2s; 0 means use lockstack's built-in default
+	LeaseTTL time.Duration // default 500ms; 0 means use lockstack's built-in default
+	CacheTTL time.Duration // default 1h; 0 means use lockstack's built-in default
 }
 
-// Public API:
-// reads env, applies defaults, validates
 func Load() *Config {
+	loadDotEnv(".env")
+
 	return &Config{
 		HTTP: HTTPConfig{
-			Addr:        envStr("HTTP_ADDR", ":8080"),
-			TCPPoolSize: envInt("HTTP_TCP_POOL_SIZE", 8),
-			WebRoot:     envStr("WEB_ROOT", "web"),
+			Addr:        envStr("HTTP_ADDR", ""),
+			TCPPoolSize: envInt("HTTP_TCP_POOL_SIZE", 0),
+			WebRoot:     envStr("WEB_ROOT", ""),
 		},
 		TCP: TCPConfig{
-			Addr: envStr("TCP_LISTEN", ":9000"),
+			Addr: envStr("TCP_LISTEN", ""),
 		},
 		MySQL: MySQLConfig{
-			DSN:     envStr("MYSQL_DSN", "app:app@tcp(127.0.0.1:3306)/userdb?parseTime=true&charset=utf8mb4"),
-			MaxOpen: envInt("MYSQL_MAX_OPEN", 50),
-			MaxWait: time.Duration(envInt("MYSQL_MAX_WAIT_MS", 200)) * time.Millisecond,
+			DSN:     envStr("MYSQL_DSN", ""),
+			MaxOpen: envInt("MYSQL_MAX_OPEN", 0),
+			MaxWait: time.Duration(envInt("MYSQL_MAX_WAIT_MS", 0)) * time.Millisecond,
 		},
 		Shard: ShardConfig{
-			DataShardDSNs:   envCSV("DATA_SHARD_DSNS", []string{
-				"app:app@tcp(127.0.0.1:3306)/data_0?parseTime=true&charset=utf8mb4",
-				"app:app@tcp(127.0.0.1:3306)/data_1?parseTime=true&charset=utf8mb4",
-			}),
-			LookupShardDSNs: envCSV("LOOKUP_SHARD_DSNS", []string{
-				"app:app@tcp(127.0.0.1:3306)/lookup_0?parseTime=true&charset=utf8mb4",
-				"app:app@tcp(127.0.0.1:3306)/lookup_1?parseTime=true&charset=utf8mb4",
-			}),
-			DataMaxOpen:    envInt("SHARD_DATA_MAX_OPEN", 10),
-			LookupMaxOpen:  envInt("SHARD_LOOKUP_MAX_OPEN", 5),
-			MaxWait:        time.Duration(envInt("SHARD_MAX_WAIT_MS", 200)) * time.Millisecond,
-			VnodesPerShard: envInt("SHARD_VNODES", 150),
+			DataShardDSNs:   envCSV("DATA_SHARD_DSNS", nil),
+			LookupShardDSNs: envCSV("LOOKUP_SHARD_DSNS", nil),
+			DataMaxOpen:     envInt("SHARD_DATA_MAX_OPEN", 0),
+			LookupMaxOpen:   envInt("SHARD_LOOKUP_MAX_OPEN", 0),
+			MaxWait:         time.Duration(envInt("SHARD_MAX_WAIT_MS", 0)) * time.Millisecond,
+			VnodesPerShard:  envInt("SHARD_VNODES", 0),
 		},
 		IDGen: IDGenConfig{
 			MachineID: envInt("MACHINE_ID", 0),
 		},
 		Redis: RedisConfig{
-			Addr:     envStr("REDIS_ADDR", "127.0.0.1:6379"),
-			Password: envStr("REDIS_PASSWORD", ""),
-			DB:       envInt("REDIS_DB", 0),
-			PoolSize: envInt("REDIS_POOL_SIZE", 50),
-			// CACHE_LAYER=off for a "without cache" run. Anything else, including
-			// unset, leaves it on.
-			UserCacheDisabled: envStr("CACHE_LAYER", "on") == "off",
+			Addr:              envStr("REDIS_ADDR", ""),
+			Password:          envStr("REDIS_PASSWORD", ""),
+			DB:                envInt("REDIS_DB", 0),
+			PoolSize:          envInt("REDIS_POOL_SIZE", 0),
+			UserCacheDisabled: envStr("CACHE_LAYER", "") == "off",
 		},
 		Uploads: UploadsConfig{
-			Root:     envStr("UPLOADS_ROOT", "uploads"),
-			MaxBytes: int64(envInt("UPLOADS_MAX_BYTES", 2*1024*1024)),
+			Root:     envStr("UPLOADS_ROOT", ""),
+			MaxBytes: int64(envInt("UPLOADS_MAX_BYTES", 0)),
 		},
 		Bcrypt: BcryptConfig{
-			Cost: envInt("BCRYPT_COST", 5),
+			Cost: envInt("BCRYPT_COST", 0),
 		},
 		Session: SessionConfig{
-			TTL: time.Duration(envInt("SESSION_TTL_SECONDS", 24*3600)) * time.Second,
+			TTL: time.Duration(envInt("SESSION_TTL_SECONDS", 0)) * time.Second,
 		},
+		LockStack: LockStackConfig{
+			LockTTL:  time.Duration(envInt("LOCKSTACK_LOCK_TTL_MS", 0)) * time.Millisecond,
+			LeaseTTL: time.Duration(envInt("LOCKSTACK_LEASE_TTL_MS", 0)) * time.Millisecond,
+			CacheTTL: time.Duration(envInt("LOCKSTACK_CACHE_TTL_SECONDS", 0)) * time.Second,
+		},
+	}
+}
+
+// loadDotEnv reads a .env file and sets vars not already present in the
+// environment. Real env vars always take precedence.
+func loadDotEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if len(v) >= 2 && (v[0] == '"' && v[len(v)-1] == '"' || v[0] == '\'' && v[len(v)-1] == '\'') {
+			v = v[1 : len(v)-1]
+		}
+		if _, set := os.LookupEnv(k); !set {
+			os.Setenv(k, v)
+		}
 	}
 }
 

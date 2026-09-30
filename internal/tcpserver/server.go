@@ -16,12 +16,14 @@ import (
 	"context"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 
 	"entry_profile_creation/internal/cache"
 	"entry_profile_creation/internal/config"
 	"entry_profile_creation/internal/db"
 	"entry_profile_creation/internal/idgen"
+	"entry_profile_creation/internal/lockstack"
 )
 
 type Server struct {
@@ -30,9 +32,10 @@ type Server struct {
 	// db holds pools to every data shard and lookup shard, plus the consistent
 	// hash ring for routing. Handlers call db.DataShardFor / db.LookupShardFor
 	// to pick the right pool before calling query helpers.
-	db    *db.ShardedHandle
-	cache *cache.Client
-	idgen *idgen.Generator
+	db        *db.ShardedHandle
+	cache     *cache.Client
+	lockstack *lockstack.LockStack
+	idgen     *idgen.Generator
 
 	listener net.Listener
 	wg       sync.WaitGroup
@@ -41,8 +44,12 @@ type Server struct {
 // NewServer takes its dependencies rather than building them, so main owns the
 // lifetime of the database and Redis connections and the handlers stay testable
 // against substitutes.
-func NewServer(cfg *config.Config, dbh *db.ShardedHandle, redis *cache.Client, gen *idgen.Generator) *Server {
-	return &Server{cfg: cfg, db: dbh, cache: redis, idgen: gen}
+func NewServer(cfg *config.Config, dbh *db.ShardedHandle, redis *cache.Client, ls *lockstack.LockStack, gen *idgen.Generator) *Server {
+	return &Server{cfg: cfg, db: dbh, cache: redis, lockstack: ls, idgen: gen}
+}
+
+func userCacheKey(userID uint64) string {
+	return "user:" + strconv.FormatUint(userID, 10)
 }
 
 func (s *Server) Run(ctx context.Context) error {

@@ -49,6 +49,7 @@ package tcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -183,33 +184,20 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 		return nil, err
 	}
 
-	// The hot path for the whole service: every page load calls this. Serving
-	// it from user:<user_id>:v<row_version> is what keeps 10M rows from
-	// turning each one into a primary-key lookup in MySQL.
-	//
-	// session.RowVersion is fetched fresh at login (see lookupUserForLogin),
-	// so this first attempt after a login is never a blind guess — it only
-	// starts missing later, if an edit happens mid-session. Trying it costs
-	// nothing extra either way: session was already being read to resolve
-	// identity, so this is zero additional round trips on the path that
-	// matters, and a wrong guess is simply a miss.
-	if cached, hit, cErr := s.cache.GetUserCache(ctx, session.UserID, session.RowVersion); cErr != nil {
-		log.Printf("get_user: read user cache for %d: %v", session.UserID, cErr)
-	} else if hit {
-		return &protocol.GetUserResult{
-			UserID:    session.UserID,
-			Username:  cached.Username,
-			Nickname:  cached.Nickname,
-			AvatarURL: cached.AvatarURL(session.UserID),
-		}, nil
-	}
-
 	dataPool := s.db.DataShardFor(session.UserID)
-	user, err := db.GetUserByID(ctx, dataPool, session.UserID)
+	data, version, err := s.lockstack.Read(ctx, userCacheKey(session.UserID), func(ctx context.Context) ([]byte, int64, error) {
+		user, err := db.GetUserByID(ctx, dataPool, session.UserID)
+		if err != nil {
+			return nil, 0, err
+		}
+		blob, err := json.Marshal(user.CachedUser())
+		if err != nil {
+			return nil, 0, err
+		}
+		return blob, int64(user.RowVersion), nil
+	})
 	switch {
 	case errors.Is(err, db.ErrUserNotFound):
-		// The session outlived its user. Revoke it rather than serving 401s
-		// until the TTL expires.
 		if delErr := s.cache.DeleteSession(ctx, d.Token); delErr != nil {
 			log.Printf("get_user: revoke orphaned session: %v", delErr)
 		}
@@ -219,23 +207,21 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 		return nil, protocol.ErrCodeInternal
 	}
 
-	// The session's hint was wrong (or absent) — correct it so the NEXT read
-	// on this session guesses right instead of missing every single time.
-	// Best-effort: see RefreshSessionRowVersion.
-	if session.RowVersion != user.RowVersion {
-		s.cache.RefreshSessionRowVersion(ctx, d.Token, session, user.RowVersion)
+	var cached model.UserCached
+	if err := json.Unmarshal(data, &cached); err != nil {
+		log.Printf("get_user: unmarshal cached data for %d: %v", session.UserID, err)
+		return nil, protocol.ErrCodeInternal
 	}
 
-	if cErr := s.cache.SetUserCache(ctx, user.ID, user.RowVersion, user.CachedUser()); cErr != nil {
-		log.Printf("get_user: populate user cache for %d: %v", user.ID, cErr)
+	if session.RowVersion != uint64(version) {
+		s.cache.RefreshSessionRowVersion(ctx, d.Token, session, uint64(version))
 	}
 
 	return &protocol.GetUserResult{
-		UserID:   user.ID,
-		Username: user.Username,
-		Nickname: user.Nickname,
-		// Derived, never stored. See model.User.AvatarURL.
-		AvatarURL: user.AvatarURL(),
+		UserID:    session.UserID,
+		Username:  cached.Username,
+		Nickname:  cached.Nickname,
+		AvatarURL: cached.AvatarURL(session.UserID),
 	}, nil
 }
 

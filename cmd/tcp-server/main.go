@@ -23,6 +23,7 @@ import (
 	"entry_profile_creation/internal/config"
 	"entry_profile_creation/internal/db"
 	"entry_profile_creation/internal/idgen"
+	"entry_profile_creation/internal/lockstack"
 	"entry_profile_creation/internal/sharding"
 	"entry_profile_creation/internal/tcpserver"
 )
@@ -74,7 +75,18 @@ func main() {
 	}
 	defer redis.Close()
 
-	server := tcpserver.NewServer(cfg, dbh, redis, gen)
+	// --- Lock stack ---
+	ls, err := lockstack.New(redis.RDB(), lockstack.Config{
+		LockTTL:  cfg.LockStack.LockTTL,
+		LeaseTTL: cfg.LockStack.LeaseTTL,
+		CacheTTL: cfg.LockStack.CacheTTL,
+		Disabled: redis.UserCacheDisabled(),
+	})
+	if err != nil {
+		log.Fatalf("tcp-server: lockstack: %v", err)
+	}
+
+	server := tcpserver.NewServer(cfg, dbh, redis, ls, gen)
 	if err := server.Run(ctx); err != nil {
 		log.Fatalf("tcp-server: %v", err)
 	}
