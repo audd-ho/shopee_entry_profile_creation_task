@@ -57,9 +57,11 @@ Build a user management system supporting signup, login, and profile edit (nickn
                                                    │       │
                                           ┌────────▼──┐ ┌──▼──────┐
                                           │  MySQL    │ │  Redis  │
-                                          │(10M+ rows)│ │         │
-                                          │ custom    │ │ cache + │
-                                          │ conn pool │ │ session │
+                                          │  shards   │ │         │
+                                          │ (data +   │ │ cache + │
+                                          │  lookup)  │ │ session │
+                                          │ custom    │ │lock stk │
+                                          │ conn pool │ │         │
                                           └───────────┘ └─────────┘
 
 Image storage: filesystem (path stored in MySQL) — see §7
@@ -97,14 +99,15 @@ Each subsection: **Options → Considerations → Decision**. Mark decisions wit
 
 **Decision: Cache-aside.** 
 
-**Sub-decisions to make:**
+**Sub-decisions — resolved (see the dedicated subsection after §4.1's versioning discussion, "Auth cache vs. user cache — the final split"):**
 - What do we cache?
-  - username to password bcrypt hash since login is the performance requirement as well
+  - **Two separate caches, not one.** `auth:<username>` holds only `{id, password_hash}` — exactly what verifying a password and minting a session need. `{user:<user_id>}` holds `<version>\n<JSON>` (version-in-value, managed by the lock stack — see `lock_stack_implementation_guide.md`) with the JSON containing `{username, nickname, avatar_suffix}` — everything a page needs to display, fetched only after a session exists. Neither cache holds a field the other one needs; there is no overlap.
+  - The username→bcrypt-hash idea below was the starting point, and is still correct as far as it goes — it just turned out to be half the picture once profile data (nickname, avatar) needed caching too, and splitting by *when it's needed* (before vs. after a session exists) rather than caching one wide record per user turned out to matter for invalidation, not just for payload size.
 - TTL?
-  - Login lookups: ~5-10 min.
-  - Profile: longer, e.g. 1 hr.
+  - `auth:<username>`: 10 min.
+  - `{user:<user_id>}`: 1 hr (set by lock stack's `CacheTTL` / `LOCKSTACK_CACHE_TTL_SECONDS`).
 - Invalidation policy on profile edit: delete-on-write vs write-through?
-  - delete-on-write based on below
+  - **Superseded:** now handled by the lock stack (lock → DEL → DB UPDATE → write-through → unlock). See `lock_stack_implementation_guide.md`. The original delete-on-write reasoning below remains valid as historical context for why bare write-through was rejected.
 - Negative caching (cache "user not found" for a short TTL to protect against enumeration/lookup spam)
   - not needed for now, easy to implement in the future if need, not a priority
 - **DB versioning**
@@ -161,15 +164,15 @@ Delete-on-write is race-safe (deleting is idempotent; next read refetches fresh)
 - One extra DB read on next access — acceptable trade
 - Consistent with "cache-aside" pattern from on top
 
-**Invalidation triggers:**
+**Invalidation triggers (updated for the lock stack + auth:/user: split):**
 
-| Action | Keys to invalidate |
+| Action | Cache operation |
 |---|---|
-| Nickname update | `user:<username>:old_row_version`, `profile:<user_id>:old_row_version` |
-| Avatar update | `user:<username>:old_row_version`, `profile:<user_id>:old_row_version` |
-| Signup | `user:<username>` (only relevant if negative caching implemented, not implemented) |
-| Logout | `sess:<token>` (pure cache, no db involvement, no need for versioning) |
-| Password change (future) | `user:<username>:old_row_version` + all sessions for that user |
+| Nickname update | Lock stack write path on `{user:<user_id>}`: lock → DEL → DB UPDATE → Lua version-compare write-through → unlock. `auth:<username>` untouched. |
+| Avatar update | Same lock stack write path on `{user:<user_id>}`. `auth:<username>` untouched. |
+| Signup | none (no negative caching — see below) |
+| Logout | `DEL sess:<token>` (pure cache, no db involvement, no need for versioning) |
+| Password change (future — no such feature exists today) | `auth:<username>` + all sessions for that user |
 
 **Negative caching note:** if we implement "user not found" negative caching, signup MUST invalidate that marker (`DEL user:<newuser>`), else login for a just-created user would incorrectly report not-found for the TTL window. Currently deferred; add if enumeration attacks become a concern.
 - for the current set up, this is of a low priority but was considered.
@@ -187,7 +190,32 @@ Delete-on-write is race-safe (deleting is idempotent; next read refetches fresh)
   - per row versioning
     - the inverse of the above actually, so this is preferred here for the DB
 
-**Implementation note (resolved in §4.4.4):** the per-row version above is a dedicated `row_version` column. It was originally kept separate from an `avatar_version` column (§4.4) for exactly the reason below — but `avatar_version` was later removed entirely (§4.4.4 point 3a), so today `row_version` is simply the only version counter in the schema. `row_version` bumps on *any* mutating write (nickname or avatar) and is embedded only in the `profile:<user_id>:v<row_version>` Redis key — **not** `user:<username>`, which is deliberately left unversioned (see §5's Redis key table for why). The historical reasoning for keeping the two counters separate, back when both existed: conflating them would have made a nickname-only edit bump `avatar_version` too, pointing avatar URLs at a version whose file was never written — see §4.4.4 point 4 for the full race analysis, which remains accurate as a record of why that design used two counters, even though only one exists now.
+**Implementation note (resolved in §4.4.4, updated for lock stack):** the per-row version above is a dedicated `row_version` column. It was originally kept separate from an `avatar_version` column (§4.4) for exactly the reason below — but `avatar_version` was later removed entirely (§4.4.4 point 3a), so today `row_version` is simply the only version counter in the schema. `row_version` bumps on *any* mutating write (nickname or avatar) and is now embedded in the **value** of the `{user:<user_id>}` Redis key (format: `<version>\n<JSON data>`), managed by the lock stack's Lua scripts — **not** in the key name (the earlier version-in-key design `user:<id>:v<N>` was superseded by the lock stack). `auth:<username>` remains unversioned and does not carry `row_version`. The historical reasoning for keeping the two counters separate, back when both existed: conflating them would have made a nickname-only edit bump `avatar_version` too, pointing avatar URLs at a version whose file was never written — see §4.4.4 point 4 for the full race analysis, which remains accurate as a record of why that design used two counters, even though only one exists now.
+
+---
+
+#### 4.1.1 Auth cache vs. user cache — the final split (post-implementation)
+
+The table above already reflects the outcome; this subsection is the reasoning, since it took a few rounds to land on.
+
+**The starting design cached one record per user under `user:<username>`,** containing everything a login might eventually need to display: `id`, `password_hash`, `nickname`, `avatar_suffix`, and (once §4.1's versioning was added) `row_version`. That is a natural first cut — one user, one cache entry — but it conflates two things with genuinely different lifecycles: *authenticating* (needs only the password hash) and *displaying a profile* (needs nickname/avatar, never the hash). Splitting them into `auth:<username>` and `{user:<user_id>}` (now managed by the lock stack with version-in-value) is what the current design does, and each field question below was resolved by asking which of those two jobs actually needs it.
+
+**Why `row_version` does not live in `auth:<username>` or in the session — superseded by the lock stack:**
+
+> **Historical note (superseded):** the reasoning below was written when the user cache used version-in-key (`user:<id>:v<N>`), which required the session to carry a `row_version` hint so readers could form the correct cache key. An intermediate version of this design put that hint in `auth:` to seed it at login, then moved it to a fresh MySQL read on every login when that proved stale-prone. **The lock stack eliminates the need entirely:** the user cache now uses a single key `{user:<user_id>}` with version-in-value (format `<version>\n<data>`), so there is no version to guess — every reader hits the same key. The session no longer carries `row_version` at all, and the login path no longer needs a `GetRowVersion` call. The original reasoning is preserved below as a record of why earlier designs needed it and why each alternative failed.
+
+<details>
+<summary>Historical reasoning (version-in-key era, now superseded)</summary>
+
+- A hint cached in `auth:` can only ever be as fresh as the last time that key was populated. Once nickname/avatar edits stopped needing to touch `auth:` at all (nothing left in it that they could make stale), nothing kept that hint honest between populations — it could go stale for the entirety of its 10-minute TTL, and the only way to fix that without giving up the split would have been to invalidate `auth:` on every profile edit anyway, which defeats the point of splitting it out in the first place (and doubles the Redis writes per edit, one for each cache, back to where the split started).
+- The alternative resolved on: **fetch `row_version` fresh from MySQL on every login**, unconditionally — not a cached guess, not a hardcoded `0`. Cost: one extra indexed `SELECT row_version FROM users WHERE id = ?` on an `auth:` cache **hit** (the common case); zero extra on a **miss**, since the miss-path query (`SELECT id, password_hash, row_version FROM users WHERE username = ?`) already returns it in the same round trip.
+- **Why pay that cost rather than seed a session's hint at `0` and let it self-correct lazily:** the real product flow is login immediately followed by the landing page's own `get_user` call — not two independently-optional events, one glued pathway. The deciding factor was determinism of the combined pathway a real user experiences.
+
+</details>
+
+**What this means for invalidation:** `auth:<username>` now holds only `id` and `password_hash`, both immutable in this service's current feature set (no change-password endpoint exists). So it needs **no invalidation path at all** today, beyond its own TTL — nickname and avatar edits are handled entirely by the lock stack on `{user:<user_id>}`. `InvalidateOnPasswordChange` is kept in the codebase even though it has no caller, against the day a change-password feature exists — deleting working code for an out-of-scope feature just means writing it again later.
+
+**What this means for the session record:** with nothing left that needs `username` for invalidation (see the previous paragraph), and `get_user`'s response able to read `username` from `{user:<user_id>}` just as well, `Session.Username` was removed. With the lock stack replacing version-in-key, `Session.RowVersion` was also removed — the user cache uses a single key per user, so there is no version hint to carry. The session record now holds only `{user_id, created_at, last_seen, ip}` — purely "who is this, and are they still logged in."
 
 ---
 
@@ -215,9 +243,10 @@ Delete-on-write is race-safe (deleting is idempotent; next read refetches fresh)
 - Session TTL: 24h? Sliding window (refresh on activity) or fixed?
   - sliding window, rolling, refresh for next 24h every time
 - Session key format: `sess:<random-256-bit>` → JSON `{user_id, created_at, ip, last_seen}`. [in redis]
+  - `row_version` was removed from the session when the lock stack replaced version-in-key — the user cache now uses a single key `{user:<id>}`, so no version hint is needed.
   - ip is for different ip, suspicious behaviour, but if want to expand can use, if not, can leave as so, no problem, last seen for rolling refresh
 
-**Status:** sesssion cookie + TTL & sliding behavior.
+**Status:** session cookie + TTL & sliding behavior.
 
 ---
 
@@ -508,7 +537,7 @@ Example for user_id = 12345:
    - **What this costs:** the orphan sweeper (see "Orphan cleanup" below) loses the ability to tell which file is current by reading filenames alone — a random suffix carries no ordering information, unlike a version number. It now needs one MySQL read per swept user to learn the authoritative `avatar_suffix`, where the old scheme needed none. This is a real, ongoing cost (a DB read per cleanup pass instead of zero), traded for eliminating a data-corruption bug outright — worth it, but not free.
    - **The new race this ordering opens up, and its fix:** a file can now legitimately exist on disk *before* the database has been told about it — the normal state during the gap between the rename below landing and the `UPDATE` committing. A sweeper that decides what to keep by asking "does the DB currently point at this file?" would, during exactly that gap, see a brand-new file the DB doesn't yet reference and correctly-but-wrongly conclude it is an orphan. Deleting it there is worse than the bug this reordering fixed, because it needs no crash at all — an ordinary sweep tick landing at an unlucky moment is enough, and at 10M-user scale, anything that *can* happen on a given upload *will* happen periodically. **Fix: any sweeper must skip every file younger than a fixed grace period (`AvatarSweepGracePeriod` in code, 10 minutes), checked via filesystem mtime, before ever consulting the database — unconditionally, regardless of what the DB says.** Ten minutes is two to three orders of magnitude longer than an upload plus its `UPDATE` could plausibly take, so it costs nothing in the common case while closing the race structurally rather than probabilistically. No sweeper exists in the codebase yet; this requirement is recorded here and as a named constant in code specifically so whichever one is written next cannot miss it.
 
-4. **`row_version` / `avatar_version` conflation race (historical — kept as a record of why the two counters were designed separately; `avatar_version` no longer exists, see point 3a):** §4.1 decided **per-row** cache versioning: a single version number that bumps on *either* nickname update or avatar upload, used to build the `profile:<user_id>:v<N>` Redis cache key (`user:<username>` is unversioned — §5). `avatar_version` (this section, when it still existed) bumped **only** on avatar upload and was embedded in the served file's **name**, not just a cache key.
+4. **`row_version` / `avatar_version` conflation race (historical — kept as a record of why the two counters were designed separately; `avatar_version` no longer exists, see point 3a):** §4.1 decided **per-row** cache versioning: a single version number that bumps on *either* nickname update or avatar upload, now embedded in the value of the `{user:<user_id>}` Redis key via the lock stack (previously it was embedded in the key name as `user:<user_id>:v<N>`; `auth:<username>` is unversioned and, since §4.1.1, does not carry `row_version` at all — §5). `avatar_version` (this section, when it still existed) bumped **only** on avatar upload and was embedded in the served file's **name**, not just a cache key.
    - **If these were the same column:** a nickname-only update would bump `avatar_version`, and the next avatar URL built from `id + avatar_version + avatar_suffix` would point at `<id>_v<new_version>_<suffix>.jpg` — a file that was never written (only the DB counter moved, no upload happened) → broken avatar image, even though the user never touched their avatar.
    - **Fix:** keep them as two separate columns with two separate write paths:
      - `avatar_version` — bumped only inside the avatar-upload flow (step 2 below). Used only to derive the on-disk filename / URL.
@@ -532,12 +561,10 @@ Example for user_id = 12345:
    (One statement, one round trip.)
 6. Old files become orphans; async sweeper cleans them up periodically,
    subject to the mtime grace period in 3a — no sweeper implemented yet.
-7. [separate goroutine, after step 5 commits] DEL profile:<user_id>:v<old_row_version>,
-   DEL user:<username> — per §4.1 delete-on-write. (Open question, not yet
-   decided: whether `user:<username>` needs to be part of this at all once it
-   no longer caches nickname/avatar data — see §4.1's discussion of trimming
-   that cache to login-only fields. Left as both keys here to match what is
-   actually implemented today.)
+7. Cache invalidation is now handled by the lock stack's write path (lock → DEL
+   `{user:<user_id>}` → DB UPDATE → Lua write-through → unlock), not a separate
+   goroutine. `auth:<username>` is NOT touched (resolved, §4.1.1): it holds
+   nothing an avatar edit could make stale.
 ```
 If step 5 fails, the file written in steps 2-4 is simply an orphan — swept up later, same as any other orphan — and the row is exactly as it was before the request. There is no ordering under which this flow can leave MySQL pointing at a suffix whose file does not exist.
 
@@ -545,7 +572,7 @@ If step 5 fails, the file written in steps 2-4 is simply an orphan — swept up 
 ```
 1. MySQL: UPDATE users SET nickname = ?, row_version = LAST_INSERT_ID(row_version + 1) WHERE id = ?
    → then SELECT LAST_INSERT_ID() to get new_row_version
-2. [separate goroutine] DEL user:<username>, DEL profile:<user_id>:v<old_row_version>
+2. Cache invalidation handled by the lock stack write path (lock → DEL `{user:<user_id>}` → write-through → unlock) — auth:<username> not touched, same reasoning as the avatar flow above
 ```
 No file is involved, so unlike the avatar flow there was never a version-vs-suffix
 question here — `row_version` is the only atomic counter this statement touches, so it
@@ -744,7 +771,7 @@ Re-reading the task: *"Connect by MySQL Go client. **Connection Pool should be b
 At 6k+ RPS, batching multiple Redis commands per round trip is a real win. Example login flow:
 ```
 Login handler needs:
-  1. GET user:<username>      (cache lookup)
+  1. GET auth:<username>      (cache lookup)
   2. INCR rl:login:ip:<ip>    (rate limit counter) [rate limiting not implemented]
   3. SETEX sess:<token>       (create session)
 ```
@@ -985,17 +1012,27 @@ db.Query("SELECT id, nickname FROM users WHERE username = ?", username)
 ### `users` table
 
 ```sql
+-- Per data shard (data_0, data_1, ...); see schema_data.sql
 CREATE TABLE users (
-  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  id             BIGINT UNSIGNED NOT NULL,              -- snowflake ID, app-generated (§13.3)
   username       VARCHAR(32)  NOT NULL,
   password_hash  VARBINARY(60) NOT NULL,      -- bcrypt output is 60 bytes
   nickname       VARCHAR(128) NOT NULL,       -- 32 runes × up to 4 bytes
   avatar_suffix  CHAR(8)      NULL,           -- 8 hex chars (32 bits random); NULL when no avatar
-  row_version    BIGINT UNSIGNED NOT NULL DEFAULT 0,  -- bumped on ANY update (nickname or avatar); cache-key versioning only, see §4.1/§4.4.4
+  row_version    BIGINT UNSIGNED NOT NULL DEFAULT 0,  -- bumped on ANY update (nickname or avatar); version-in-value for lock stack cache, see §4.1/§4.4.4
   created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
-  UNIQUE KEY uk_username (username)
+  UNIQUE KEY uk_username (username)              -- safety net within-shard; global uniqueness via lookup shards
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+```
+
+```sql
+-- Per lookup shard (lookup_0, lookup_1); see schema_lookup.sql
+CREATE TABLE username_lookup (
+  username  VARCHAR(32)      NOT NULL,
+  user_id   BIGINT UNSIGNED  NOT NULL,
+  PRIMARY KEY (username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 ```
 
@@ -1014,79 +1051,47 @@ file-first-then-database instead).
 - `VARBINARY(60)` for bcrypt (fixed size).
 - Avatar path is **derived**, not stored: `/uploads/<id >> 14>/<id>/<id>_<avatar_suffix>.jpg` (see §4.4). `avatar_suffix` being NULL is the sole signal for "no avatar" — there is no version to check alongside it.
 - Row footprint is smaller than the version-numbered scheme (one fewer `INT` column) as well as than storing a full path — meaningful at 10M rows for buffer pool efficiency.
-- `row_version` is unrelated to the avatar scheme above, and unaffected by removing `avatar_version` — the two were already deliberately separate counters (§4.4.4 point 4). `row_version` exists purely to build/tear down Redis cache keys per §4.1's per-row versioning decision, and never appears in an avatar filename.
+- `row_version` is unrelated to the avatar scheme above, and unaffected by removing `avatar_version` — the two were already deliberately separate counters (§4.4.4 point 4). `row_version` exists purely for the lock stack's version-in-value cache consistency (embedded in the value of `{user:<user_id>}`, compared by Lua scripts), and never appears in an avatar filename.
 
 ### Redis keys
 
 | Key | Value | TTL |
 |---|---|---|
-| `sess:<token>` | JSON `{user_id, username, row_version, created_at, ip?, last_seen}` | 24h sliding |
-| `user:<username>` (NOT versioned — see note below) | JSON `{id, password_hash, nickname, avatar_suffix, row_version}` | 10 min |
-| `profile:<user_id>:v<row_version>` | JSON `{nickname, avatar_suffix}` | 1 h |
+| `sess:<token>` | JSON `{user_id, created_at, ip?, last_seen}` | 24h sliding |
+| `auth:<username>` | JSON `{id, password_hash}` | 10 min |
+| `{user:<user_id>}` | `<version>\n<JSON>` where JSON = `{username, nickname, avatar_suffix}`. Managed by lock stack (version-in-value, lease-guarded reads). Hash tag `{…}` ensures data key and lock key colocate in Redis Cluster. | 1 h (`LOCKSTACK_CACHE_TTL_SECONDS`) |
+| `{user:<user_id>}:lock` | `<writer_id>` — per-key write lock held during the lock stack write path | `LOCKSTACK_LOCK_TTL_MS` (watchdog-extended) |
+| `lookup:<username>` | JSON `{user_id}` — immutable once written, no versioning needed | 10 min |
 | `rl:login:ip:<ip>` | counter | 5 min |
 | `rl:login:user:<uname>` | counter | 15 min |
 
-**Why `user:<username>` is NOT versioned, unlike `profile:<user_id>`:** a versioned
-key needs the caller to already know which version to ask for *before* forming the
-GET — otherwise caching buys nothing, since learning the version would itself cost
-a lookup. For `profile:<user_id>` that is free: the session record is being read on
-every authenticated request anyway (to resolve identity), so it carries a
-`row_version` hint at near-zero marginal cost. Login has no such source — it is,
-by definition, the *first* touch of Redis for this identity, before any session
-exists — so versioning this key would force either a second Redis round trip or a
-MySQL read on every single login, defeating the cache that matters most for the
-login-RPS targets. `row_version` is still carried inside the *value* here (not the
-key), purely so a cache-hit login can seed the new session's hint accurately rather
-than always seeding 0 and guaranteeing one wasted miss on that session's first
-profile read.
+**Why `auth:<username>` is not versioned:** `auth:` holds only `{id, password_hash}`, both immutable in the current feature set (no change-password endpoint). It needs no versioning and no invalidation beyond its own TTL. Profile edits are handled entirely by the lock stack on `{user:<user_id>}`.
 
-**Open question, not yet decided:** whether `user:<username>` should be trimmed to
-only what login actually needs — `{id, password_hash, row_version}` — dropping
-`nickname` and `avatar_suffix`, which nothing on the login path reads (`/api/me`'s
-`nickname`/`avatar_url` come from `profile:<user_id>`, already fetched separately,
-after login). If trimmed, nickname/avatar edits would no longer need to invalidate
-`user:<username>` at all — only a password change would, since password would be
-the only field left in it that can go stale. That in turn would remove `username`
-from the arguments `InvalidateOnNicknameChange`/`InvalidateOnAvatarChange` need,
-and raises a follow-on question covered below: whether the session record still
-needs to carry `username`, or whether `profile:<user_id>` can supply it instead.
+**`row_version` is now embedded in the value, not the key** (lock stack design, superseding the earlier version-in-key `user:<id>:v<N>` approach): the user cache uses a single key `{user:<user_id>}` with the value formatted as `<version>\n<JSON data>`. The lock stack's Lua `versionSetScript` atomically compares versions before writing, and the writer's DEL-first ordering (M7) plus the reader lease (M13) prevent slow-reader overwrites. This eliminated the need for version-in-key and, consequently, the need for the session to carry a `row_version` hint. See `lock_stack_implementation_guide.md` for the full design.
 
-**Why `row_version` is embedded in the key, not the value** (per §4.1): the previous version's key becomes unreachable the instant `row_version` bumps in MySQL, without needing a delete to race against a concurrent read. The delete-on-write goroutine (§4.1, §4.4.4) still deletes the old key so it doesn't linger to TTL, but correctness doesn't depend on that delete winning any race.
+> **Historical note (superseded):** the earlier version-in-key design (`user:<id>:v<N>`) made the old key unreachable the instant `row_version` bumped in MySQL, without needing a delete to race against a concurrent read. The delete-on-write goroutine still deleted the old key so it didn't linger to TTL, but correctness didn't depend on that delete winning any race. That design required the session to carry `row_version` so readers could form the correct key, which in turn required a fresh MySQL `GetRowVersion` read on every login — all of which the lock stack's version-in-value approach removes.
 
 **Cache-key design rationale:**
 
 - **Not per-field caching.** Every hot-path read (login, `/api/me`) needs most fields together — per-field GETs would multiply Redis ops for the same data. Single JSON blob per logical access pattern is faster.
-- **Two keys per user, not one.** Splitting by access pattern:
-  - `user:<username>` — indexed by username for login (contains password_hash).
-  - `profile:<user_id>` — indexed by user_id for `/api/me` (no hash needed).
+- **Two keys per user, not one — split by *when* the data is needed, not just by size.** The original split reasoning was "password hash vs. everything else"; the reasoning that stuck (§4.1.1) is sharper: `auth:` holds exactly what authenticating requires and nothing a profile edit could ever touch, `user:` holds exactly what a page display requires and nothing that must never leave the server.
+  - `auth:<username>` — indexed by username, for login only. Contains the password hash; contains nothing else.
+  - `{user:<user_id>}` — indexed by user_id, for everything after login. Contains username, nickname, avatar (version-in-value); never the hash. Managed by the lock stack.
 - **Split benefits:**
-  - Different TTLs (password hash long-lived, profile shorter since edits are more frequent).
-  - Cleaner invalidation: profile edits invalidate only `profile:<user_id>`; login-critical `user:<username>` stays hot.
-  - Different index keys naturally — username lookup for login, id lookup for profile.
+  - Different TTLs (password hash long-lived relative to how rarely it's read again once cached; profile shorter, since edits are more frequent than password changes would be).
+  - Clean invalidation: a nickname/avatar edit touches `user:<user_id>` only. `auth:<username>` needs no invalidation path at all today, because nothing in it can go stale in this service's current feature set (§4.1.1).
+  - Different index keys naturally — username lookup for login, id lookup for everything after.
 - **`sess:<token>` and rate-limit keys** are separate concerns (session state, counters); no user data leaks in them.
 
-**Why session stores `username` alongside `user_id` (current implementation; see the open question above — this whole rationale is what's under review):**
+**Why the session record stores only `{user_id, created_at, last_seen, ip}`:** `username` was removed once `auth:<username>` stopped needing invalidation on profile edits (§4.1.1) — no reader needs it from the session, since `{user:<user_id>}` carries it. `row_version` was removed when the lock stack replaced version-in-key — the user cache uses a single key per user, so there is no version hint to carry (see §4.1.1). The session's only job is now "who is this, and are they still logged in."
 
-Every authenticated request must look up the session in Redis for auth (verify token exists, get identity). By storing **both** `user_id` and `username` in the session record, we get both identifiers in one Redis GET. As implemented today, this matters for cache invalidation on profile edits:
-
-```
-Nickname update flow:
-  1. Redis GET sess:<token>  → {user_id: 42, username: "alice", row_version: 5, ...}
-  2. MySQL UPDATE users SET nickname = ?, row_version = LAST_INSERT_ID(row_version + 1) WHERE id = 42
-     → new_row_version returned directly (old_row_version = new_row_version - 1; exact, not a guess)
-  3. Redis DEL profile:42:v<old_row_version>     (uses user_id from session)
-  4. Redis DEL user:alice                        (uses username from session; NOT versioned — see above)
-```
-
-Without storing username in the session, step 4 would require an extra MySQL query to look up the username. The ~20 extra bytes per session record is negligible; the extra query is not — *if* step 4 stays as it is. But step 4 only exists because `user:<username>` currently caches `nickname` and `avatar_suffix` alongside the password hash: if it is trimmed to login-only fields (the open question above), a nickname or avatar edit has nothing left in `user:<username>` to invalidate, step 4 disappears entirely, and `username` stops being something invalidation needs from the session — the only remaining consumer would be formatting the API response in `get_user`, which `profile:<user_id>` could supply just as well if `username` were added to that cache's value instead. That would make the session record's job purely "who is this and are they still logged in", with no double duty. Whether that is a net improvement, or just moves the same fact to a different place, is exactly the open question above.
-
-See §4.4.4 for why `row_version` is a separate counter from the (now-removed) `avatar_version` and why it's the one embedded in the `profile:` key.
+See §4.4.4 for why `row_version` is a separate counter from the (now-removed) `avatar_version` and why it's the one embedded in the user cache value.
 
 ### User table: no vertical split
 
 **Single `users` table, all columns together.** Considered vertical partitioning (splitting hot/cold columns into separate tables) but rejected:
 - Row width is ~134 bytes (~130 before `row_version` was added, minus the ~4-byte `avatar_version` `INT` removed in §4.4.4 point 3a) → 10M rows still fits comfortably in typical buffer pool (~1.3-1.4 GB). Neither change moves the needle on this decision.
-- All columns are accessed together on the hot path (login pulls hash + nickname + `avatar_suffix` + `row_version` — the latter needed to build the Redis cache key, not just for the row's own data).
+- The two hot-path queries pull different subsets now (§4.1.1): login (`GetUserByUsername`) reads `id, password_hash, row_version` only; `get_user` (`GetUserByID`) reads `id, username, nickname, avatar_suffix, row_version`. Both are still single-row, single-table reads by an indexed column — the split changed which columns are selected, not how many tables are touched, so it is not an argument for splitting the table itself. `row_version` rides along on both queries because both need it to build a Redis cache key, not for the row's own data.
 - Splitting would add JOIN cost on every read for no memory or lock-contention benefit.
 - Query-level column selection (`SELECT` only what you need) already handles per-request data minimization.
 - Vertical partitioning would only pay off with rows >1 KB or clearly bimodal hot/cold access, neither of which applies.
@@ -1226,21 +1231,23 @@ Beyond RPS/latency, we want to profile the running binary at the process/CPU/mem
 
 ## 9. Open Questions / Still TBD
 
-- [ ] **Language: confirm Go** (§4.5) — inferred from "MySQL Go client" but not explicit
-- [ ] **HTTP framework**: `net/http` vs `chi` vs `gin` (§4.5)
-- [ ] Session TTL & sliding-vs-fixed (§4.2)
-- [ ] What exactly to cache and cache TTLs (§4.1)
-- [ ] Custom pool sizing + idle policy (§4.6)
-- [ ] TCP protocol connection pool size + timeouts (§4.7)
 - [ ] `SameSite=Lax` vs `Strict` (§4.9)
-- [ ] bcrypt cost — confirm after seeing perf harness behavior (§4.3)
-- [ ] Trim `user:<username>` to login-only fields (`id`, `password_hash`, `row_version`), dropping `nickname`/`avatar_suffix` since nothing on the login path reads them (§5's Redis key table). Follow-on if trimmed: whether nickname/avatar invalidation still needs `user:<username>` at all, and whether the session record still needs to carry `username` or can rely on `profile:<user_id>` for it instead (§5, "Why session stores `username`").
 
 **Resolved:**
+- ✅ **Language:** Go (§4.5)
+- ✅ **HTTP framework:** `net/http` (§4.5)
+- ✅ **Session:** 24h sliding-window TTL (§4.2). Session holds `{user_id, created_at, last_seen, ip}` — `row_version` removed with lock stack.
+- ✅ **Cache strategy:** two caches (`auth:<username>` + `{user:<user_id>}` via lock stack), TTLs 10 min / 1 hr. Lock stack write path (lock → DEL → DB UPDATE → write-through → unlock) replaces simple delete-on-write (§4.1).
+- ✅ **bcrypt cost:** 5 (§4.3), matched to seeded data.
+- ✅ **Custom pool sizing:** data shards 10 conns/shard, lookup shards 5 conns/shard, 200ms max wait (§4.6).
+- ✅ **TCP protocol pool:** 8 connections, multiplexed (§4.7).
 - ✅ Filename scheme + directory sharding (§4.4) — `<user_id>_<suffix>.jpg` (no version segment — `avatar_version` was tried, then removed post-implementation, §4.4.4 point 3a) in `/uploads/<user_id >> 14>/<user_id>/` (fixed-size range partitioning, extends to hybrid pattern on horizontal scaling)
 - ✅ Avatar URL public with unguessable filename (§4.4.5)
 - ✅ Redis pool via library (`go-redis`), not custom (§4.6.1)
-- ✅ HTTP↔TCP framing: newline-delimited JSON for v1; binary framing shelved (§4.7)
+- ✅ HTTP↔TCP framing: streaming JSON for v1; binary framing shelved (§4.7)
+- ✅ Split the login cache from the profile cache (§4.1.1) — `user:<username>` became `auth:<username>` (trimmed to `{id, password_hash}` only), `profile:<user_id>` became `{user:<user_id>}` (version-in-value via lock stack). `Session.Username` and `Session.RowVersion` both removed.
+- ✅ **Horizontal sharding** (§13) — implemented: 2 lookup shards, 2 data shards (scalable to 3+), snowflake IDs, consistent hash ring.
+- ✅ **Lock stack** — per-key Redis lock with watchdog, DEL-first ordering, Lua version-compare write-through, reader lease (M13). See `lock_stack_implementation_guide.md`.
 
 **Shelved (documented, not implemented; revisit if time permits):**
 - ⏸ Rate limiting (§4.8) — brute-force protection deferred
@@ -1253,7 +1260,8 @@ Beyond RPS/latency, we want to profile the running binary at the process/CPU/mem
 
 - Migrate images to object storage (S3/OSS/COS/MinIO) + CDN
 - TLS everywhere (HTTPS, mTLS between servers)
-- Horizontal scale: multiple TCP servers behind an internal LB; Redis Cluster; MySQL read replicas
+- Redis Cluster (when single-instance Redis becomes a bottleneck); MySQL read replicas per shard
+- Multiple TCP server instances behind an internal LB (architecture already supports it — stateless, machine_id-based snowflakes)
 - Observability: structured logs, Prometheus metrics, distributed tracing
 - Zero-downtime deploys, graceful shutdown, health checks
 - Password reset flow, email verification, 2FA
@@ -1305,3 +1313,809 @@ Beyond RPS/latency, we want to profile the running binary at the process/CPU/mem
 - Open TBDs in §9
 
 **How to resume:** open `system_design.md`, review §9 (TBDs), start with the language question.
+
+---
+
+## 13. Horizontal Sharding Design (Implemented)
+
+Implemented for this entry task — 2 lookup shards and 2 data shards (scalable to
+3+) on localhost, all as separate MySQL schemas on the same mysqld instance. The
+Go code treats each shard as an independent pool, so migrating to separate hosts
+is a DSN change, not a code change. This section documents the full design
+reasoning so the seams are visible during review.
+
+---
+
+### 13.1 High-Level Sharded Topology
+
+```
+   Browser
+     │  HTTPS/HTTP
+     ▼
+┌──────────────┐
+│  HTTP Server │  (N instances, stateless, round-robin LB)
+│  (Go)        │
+└──────┬───────┘
+       │  TCP (custom protocol, multiplexed)
+       │  Round-robin — any TCP server handles any user
+       ▼
+┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+│ TCP Server 0 │   │ TCP Server 1 │   │ TCP Server 2 │
+│  machine_id=0│   │  machine_id=1│   │  machine_id=2│
+│              │   │              │   │              │
+│ Generates    │   │ Generates    │   │ Generates    │
+│ snowflake IDs│   │ snowflake IDs│   │ snowflake IDs│
+│ locally      │   │ locally      │   │ locally      │
+└──┬───┬───┬───┘   └──┬───┬───┬───┘   └──┬───┬───┬───┘
+   │   │   │          │   │   │          │   │   │
+   │   │   │          │   │   │          │   │   │
+   │   │   └──────────┼───┼───┼──────────┼───┼───┤
+   │   └──────────────┼───┼───┤          │   │   │
+   └──────────────────┤   │   │          │   │   │
+                      ▼   ▼   ▼          ▼   ▼   ▼
+                 ┌─────────────────────────────────────┐
+                 │        Every TCP server holds        │
+                 │        a pool to every shard         │
+                 └──┬──────────┬──────────┬────────────┘
+                    │          │          │
+               ┌────▼───┐ ┌───▼────┐ ┌───▼────┐
+               │ Shard 0 │ │ Shard 1│ │ Shard 2│   MySQL shards
+               │ users   │ │ users  │ │ users  │   (sharded by user_id)
+               └─────────┘ └────────┘ └────────┘
+
+  ┌─────────────────────────┐       ┌──────────┐
+  │  Username Lookup        │       │  Redis   │
+  │  (shared, unsharded)    │       │  (shared)│
+  │  username → user_id     │       │  sessions│
+  │  Written on signup      │       │  + caches│
+  │  Read on login          │       │          │
+  └─────────────────────────┘       └──────────┘
+```
+
+**Key properties:**
+- **TCP servers are stateless.** Any instance handles any user. The HTTP load
+  balancer remains dumb round-robin — no application-layer routing.
+- **Every TCP server connects to every DB shard** (one pool per shard). Shard
+  selection happens inside the TCP server as a one-line pool lookup:
+  `pool := s.shards[ShardFor(userID)]`. No TCP-to-TCP forwarding.
+- **The username lookup is the only shared, unsharded data store.** All other
+  queries route by `user_id`, which is on the session for all post-login paths.
+
+---
+
+### 13.2 Shard Key — `user_id` via Consistent Hashing
+
+**Decision: shard by `user_id`.**
+
+| Shard by | Login (`WHERE username=?`) | Post-login (`WHERE id=?`) | Uniqueness |
+|---|---|---|---|
+| `username` | Single-shard (fast) | Needs username→id→shard mapping | Free (one shard owns each username) |
+| **`user_id` (chosen)** | Needs username→id lookup, then single-shard | Single-shard (fast) | Needs external uniqueness check |
+
+**Reasoning:**
+- The vast majority of queries are post-login and by `user_id` (get_user,
+  update_nickname, update_avatar on every page load). Optimising the shard key
+  for the 99% case over the 1% case (signup/login by username) is correct.
+- Login is already the slow path (bcrypt dominates). One extra lookup to resolve
+  username→user_id is negligible next to a 2ms bcrypt compare.
+- The username→id mapping is small, write-once-read-many, and fits in memory.
+- Integer comparisons for shard routing and B-tree traversal are single CPU
+  instructions regardless of magnitude — `5 < 6` costs the same as
+  `483927481 < 892034712` (both fit in one 64-bit register, one `CMP`). There
+  is no performance advantage to small sequential IDs over large snowflake IDs.
+
+---
+
+#### 13.2.1 Consistent Hashing (Ring Hash) — How It Works
+
+**Why not simple modulo (`user_id % N`)?**
+- Changing N (adding/removing a shard) reshuffles ~(N-1)/N of all users. With
+  3 shards → 4, about 75% of users land on a different shard and need migration.
+- Consistent hashing moves only ~1/N (~25%) when adding one shard.
+
+**The ring:**
+
+Nodes (shards) and keys (user_ids) are hashed onto a circular number line
+(0 to 2³²-1). A key hashes to a position and walks **clockwise** to the first
+node it hits. That node owns it.
+
+```
+        Shard 0 (pos 100)
+       /
+  0 ──●────────────●── Shard 1 (pos 400)
+  │      Ring           │
+  │                     │
+  └────●────────────────┘
+     Shard 2 (pos 700)
+
+user_id 42 hashes to 250 → walks clockwise → hits Shard 1
+user_id 99 hashes to 500 → walks clockwise → hits Shard 2
+user_id 7  hashes to 50  → walks clockwise → hits Shard 0
+```
+
+**Adding a shard (the key property):**
+
+Say Shard 3 joins at position 550:
+
+```
+Before:  keys 401-700 → Shard 2
+After:   keys 401-550 → Shard 3  (moved FROM Shard 2 only)
+         keys 551-700 → Shard 2  (unchanged)
+         keys 0-100   → Shard 0  (unchanged)
+         keys 101-400 → Shard 1  (unchanged)
+```
+
+Only keys between the new node and its predecessor move. They come from **one
+neighbor** (the clockwise successor), not from all nodes. Everything else stays
+put. This is the core win.
+
+**Removing a shard:** the reverse. Its keys walk clockwise to the next node. One
+neighbor absorbs them. Still ~1/N movement.
+
+**The balance problem and virtual nodes (vnodes):**
+
+With only 3 physical nodes, the arc lengths between them are uneven — one node
+could own 60% of the ring by chance. Fix: each physical node gets 100-200
+positions (vnodes) on the ring. Statistically, the arcs even out.
+
+```
+Node A: positions 100, 1500, 3200, 4800, ...  (150 vnodes)
+Node B: positions 400, 1800, 3500, 5100, ...  (150 vnodes)
+Node C: positions 700, 2100, 3800, ...        (150 vnodes)
+```
+
+A key hashes to 1600 → walks clockwise → hits vnode at 1800 → that's physical
+Node B. Adding a physical node distributes its vnodes around the ring and each
+one steals a small arc from a different neighbor — smooth, even rebalancing
+across all existing shards.
+
+**Implementation in Go:** there are libraries (e.g. `hashicorp/consistent`), or
+it's ~50 lines: a sorted slice of `(hash, shardID)` pairs, binary-searched for
+each lookup. Performance is O(log V) where V = total vnodes — negligible.
+
+---
+
+### 13.3 ID Generation — Snowflake IDs
+
+**Problem:** `AUTO_INCREMENT` generates IDs on one MySQL instance. With multiple
+shards, two instances would produce colliding IDs.
+
+**Options considered:**
+
+| Approach | Coordination? | Fits BIGINT? | B-tree locality | Survives resharding |
+|---|---|---|---|---|
+| Central auto-increment counter | Yes (single point of failure, bottleneck) | ✅ | ✅ (sequential) | ✅ |
+| DB increment-by-step (`auto_increment_increment=N`) | Config-time only | ✅ | ✅ | ❌ (changing N breaks the step scheme) |
+| Random UUID (128-bit) | None | ❌ (needs BINARY(16), 2× PK width) | ❌ (random scatter → page splits, poor buffer pool) | ✅ |
+| ULID (128-bit, time-sorted) | None | ❌ (still 128 bits) | ✅ (time-sorted) | ✅ |
+| **Snowflake (64-bit, time-sorted)** | Machine ID assignment only | ✅ | ✅ (time-sorted) | ✅ |
+
+**Decision: application-generated snowflake IDs.** Each TCP server generates
+64-bit IDs locally with no coordination and no DB round trip.
+
+```
+ 64-bit ID layout (fits in BIGINT UNSIGNED):
+ ┌─────────────────────────────┬──────────┬──────────────┐
+ │  41 bits: millisecond       │ 10 bits: │ 12 bits:     │
+ │  timestamp since custom     │ machine  │ sequence     │
+ │  epoch (69 years range)     │ ID       │ (4096/ms)    │
+ └─────────────────────────────┴──────────┴──────────────┘
+```
+
+| Component | Bits | Range | Purpose |
+|---|---|---|---|
+| Timestamp | 41 | ~69.7 years from custom epoch | Time-sorted for B-tree locality |
+| Machine ID | 10 | 0–1023 TCP server instances | Prevents collisions across servers |
+| Sequence | 12 | 0–4095 per ms per machine | Handles burst within one millisecond |
+
+**Custom epoch:** not Unix epoch (1970) — pick the service launch date. This
+avoids wasting bits on the 50+ years already passed. 2⁴¹ ms ≈ 69.7 years
+from the chosen epoch.
+
+**Machine ID assignment:** the only coordination needed, and it's one-time at
+startup. Options: config file / env var per instance, or a coordination service
+(ZooKeeper, etcd) that leases machine IDs. For a handful of TCP servers, a
+config value is simplest.
+
+**Properties:**
+- **No central counter.** Each TCP server generates IDs independently.
+- **No collisions.** Same millisecond + different machine bits = different IDs.
+  Same machine + same millisecond + different sequence bits = different IDs.
+- **Time-sorted.** High bits are the timestamp, so IDs are roughly chronological.
+  New inserts cluster near the rightmost B-tree leaf — same locality benefit as
+  `AUTO_INCREMENT`. This is the key advantage over random UUIDs, which scatter
+  inserts across the entire index causing page splits and poor buffer pool hit
+  rates.
+- **Fits in `BIGINT UNSIGNED`.** No schema type change from the current `id`
+  column — just remove `AUTO_INCREMENT` and supply the ID from Go.
+- **Shard-independent.** The ID encodes no shard information. `ShardFor(id)` is
+  a separate function (consistent hash) that can change without re-issuing IDs.
+- **Density doesn't matter.** The IDs have gaps (machine bits, sequence bits
+  create holes). But density was never useful — nobody queries
+  `WHERE id BETWEEN 1 AND 1000` expecting exactly 1000 rows. In practice,
+  auto-increment IDs also have gaps (rolled-back transactions, deletes).
+
+**Go implementation** (no bitfield syntax in Go — explicit shifts, same as
+C++ in practice since bitfield ordering is implementation-defined):
+```go
+id := (timestamp << 22) | (machineID << 12) | sequence
+
+// Reading back:
+timestamp := id >> 22
+machineID := (id >> 12) & 0x3FF   // 10-bit mask
+sequence  := id & 0xFFF            // 12-bit mask
+```
+
+This is the same as C/C++ bitfield packing (`struct { uint64_t seq:12; ... }`)
+but explicit. C++ bitfields look cleaner in source but have implementation-
+defined bit ordering across compilers/endianness, so most C++ snowflake
+implementations also use explicit shifts for portability.
+
+**Throughput:** 4,096 IDs/ms/machine = 4,096,000 IDs/sec/machine. If a machine
+exhausts 4096 in one millisecond (extremely unlikely for user signups), it waits
+for the next millisecond — a sub-millisecond stall. With 1024 machines, the
+system can produce ~4 billion IDs/sec total.
+
+---
+
+### 13.4 Username Lookup — Global Uniqueness
+
+**Problem:** with the `users` table sharded by `user_id`, the `UNIQUE KEY
+uk_username` only enforces uniqueness within one shard. Two shards can each
+accept an `INSERT` for the same username.
+
+**Decision: MySQL table as source of truth, on a separate dedicated instance,
+with Redis cache (`lookup:<username>`) on top.** Maps `username → user_id` and
+is the single source of truth for "does this username exist globally."
+
+**Why MySQL table (not purely Redis):**
+- Redis is volatile. If Redis dies/flushes, a pure-Redis lookup loses all
+  mappings and every login falls through to... nowhere (the per-shard `users`
+  tables don't have a global username index). Rebuilding from shards requires
+  scanning all shards and collecting `(username, id)` pairs — slow for 10M rows.
+- A MySQL table is durable. Redis cache on top is a performance layer — same
+  defense-in-depth as the existing `auth:<username>` cache over the `users` table.
+
+**Why a separate instance (not co-located on a data shard):**
+- Placing the lookup on one shard creates an asymmetry: that shard handles its
+  normal 1/N share of user data queries PLUS 100% of all login lookups. The
+  lookups are individually cheap (single PK read, table fits in memory), but at
+  3k-6k login RPS the volume is real and that one shard always runs hotter than
+  the others through no fault of its own data distribution.
+- A separate instance keeps every data shard's load symmetric.
+- Isolates lookup availability from data shard availability: if a data shard has
+  a problem, the lookup is unaffected — logins can still resolve username→user_id,
+  they just fail at the shard query step. If the lookup instance has a problem,
+  only signup and login are affected — post-login operations (get_user,
+  update_nickname, update_avatar) keep working because they route by `user_id`
+  from the session and never touch the lookup.
+
+```sql
+CREATE TABLE username_lookup (
+  username  VARCHAR(32) NOT NULL PRIMARY KEY,
+  user_id   BIGINT UNSIGNED NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+```
+- One row ≈ 40 bytes. 10M users ≈ 400 MB — fits entirely in memory.
+- Primary key lookup = O(log n), effectively O(1) in buffer pool.
+- Durable — survives restarts without rebuilding.
+
+**Redis cache on top:** cache-aside, same pattern as `auth:<username>`.
+
+| Key | Value | TTL | Written | Read |
+|---|---|---|---|---|
+| `lookup:<username>` | JSON `{user_id}` | 10 min | SET on signup (new entry) | GET on login (before MySQL fallback) |
+
+The data is immutable once written (a username maps to one user_id forever), so
+there is no staleness concern and no need for versioning. A cache miss on login
+falls through to the MySQL lookup table and populates the cache on the way back.
+
+**Scaling the lookup itself** (if ever needed):
+
+The lookup is **write-once-read-many** (written on signup, read on login) and
+is on its own dedicated instance, so scaling it is independent of the data
+shards.
+
+- **Read scaling:** one primary + N read replicas trivially scales the read side.
+- **Write scaling:** would need hundreds of thousands of signups per second to
+  stress the write side — far beyond what bcrypt allows through per signup.
+- **If write scaling is ever needed:** shard the lookup itself by
+  `hash(username)` — matching its own access pattern (`WHERE username = ?`).
+  This is independent of the data shards which shard by `hash(user_id)`. Each
+  store is sharded by the key it's actually queried on — no cross-shard fan-out
+  on either side. Username lookup shards still enforce global uniqueness because
+  each username hashes to exactly one lookup shard, and that shard's PK catches
+  duplicates.
+- For this system, a single instance handles the load with enormous margin.
+
+**The lookup is only touched on signup and login.** All post-login operations
+(get_user, update_nickname, update_avatar) route by `user_id` from the session
+and skip the lookup entirely. This is the critical property — the lookup is
+not on any hot path.
+
+---
+
+### 13.5 Sharded Workflows
+
+#### Signup (sharded)
+
+```
+TCP server (any, via round-robin):
+
+  1. Generate snowflake ID locally
+     (machine_id baked in, no DB round trip, no coordination)
+
+  2. username_lookup.INSERT("alice", 12345)
+     → duplicate key? → 409 username taken, stop
+     → success? → name is now globally reserved
+
+  3. shard = ShardFor(12345) → shard 1
+
+  4. shard_1_pool.INSERT(12345, "alice", hash, nickname)
+     → if this fails: DELETE from username_lookup
+       (rollback the reservation, leave no dangling mapping)
+
+  5. Return success
+```
+
+No `AUTO_INCREMENT`, no `LastInsertId()`. The ID is known before any INSERT runs.
+
+**Failure handling:** step 2 is the global uniqueness check. Step 4's failure is
+unlikely (the row doesn't exist yet on that shard), but if it does fail (disk,
+connection), the lookup reservation from step 2 must be rolled back, or
+"alice" is permanently reserved with no user behind it. This is a two-phase
+commit across two stores — the simplest form (insert A, insert B, undo A on B's
+failure). No distributed transaction needed because the lookup is a simple
+key-value map, and the undo is a single DELETE.
+
+#### Login (sharded)
+
+```
+TCP server (any, via round-robin):
+
+  1. username_lookup.GET("alice") → user_id 12345
+     → not found? → dummy bcrypt verify, return 401
+
+  2. shard = ShardFor(12345) → shard 1
+
+  3. shard_1_pool.GetUserByUsername("alice")
+     → {id, password_hash}
+
+  4. bcrypt.Compare, create session
+     (session holds {user_id, created_at, last_seen, ip} — no row_version)
+```
+
+One extra lookup (step 1) compared to the current unsharded flow. Cost: one
+primary-key read on a table that fits in memory — negligible next to bcrypt.
+
+**Auth cache interaction:** the `auth:<username>` Redis cache still works
+identically. On a cache hit, login skips step 3 (no MySQL query for the hash)
+but still needs step 1 to get the user_id (unless the auth cache is expanded to
+carry user_id — which it already does in `model.AuthCached.ID`). So the actual
+hit-path is: lookup → auth cache GET → have id and hash → bcrypt → session. No
+`GetRowVersion` call needed — the session no longer carries `row_version` (the
+lock stack's version-in-value design eliminated that need).
+
+#### Post-Login (get_user, update_nickname, update_avatar — sharded)
+
+```
+TCP server (any):
+
+  1. resolveSession(token) → {user_id}
+     (from Redis — no lookup needed, no row_version needed)
+
+  2. shard = ShardFor(user_id)
+
+  3. shard_N_pool.query(...)
+     (identical to current single-instance queries)
+```
+
+The username lookup is not involved. The session carries `user_id`, and
+`ShardFor(user_id)` is a pure function (consistent hash) — no network call.
+This is the hot path, and it adds exactly one function call (a binary search
+on a sorted slice of vnodes) per request.
+
+---
+
+### 13.6 Scaling Model — TCP Servers and DB Shards Are Independent Axes
+
+Sharding the DB and scaling the TCP servers are two **decoupled** decisions.
+
+```
+                    TCP servers                    DB shards
+                    (CPU-bound:                    (IO-bound:
+                     bcrypt, JSON,                  disk, buffer pool,
+                     protocol framing)              query execution)
+                         │                              │
+  Add TCP servers ───────┤          Add DB shards ──────┤
+  for more bcrypt        │          for more storage     │
+  throughput             │          or query IOPS        │
+                         │                              │
+                    No change to                   No change to
+                    DB shards                      TCP servers
+```
+
+#### Option A — Every TCP server connects to every DB shard (chosen)
+
+```
+TCP-0 ──┬── DB shard 0
+TCP-1 ──┼── DB shard 1
+TCP-2 ──┴── DB shard 2
+```
+
+- Any TCP server can handle any request — HTTP LB stays dumb round-robin.
+- Each TCP server holds one pool per shard. Total connections =
+  `tcp_count × shard_count × pool_size`. Example: 3 × 3 × 10 = 90 total.
+  MySQL handles thousands; this is negligible.
+- TCP and DB scale independently: add TCP servers for CPU (bcrypt), add DB
+  shards for storage/IOPS.
+- **Failover is free:** a hot shard doesn't mean a hot TCP server. If one TCP
+  server dies, the others keep serving all shards via the HTTP LB's existing
+  health-check + round-robin.
+- The TCP server is stateless (no local data, just connection pools), so any
+  instance serves any user. Adding shards just means each TCP server's pool
+  list grows by one entry.
+
+#### Option B — TCP server paired 1:1 with its DB shard (rejected)
+
+```
+TCP-0 ── DB shard 0
+TCP-1 ── DB shard 1
+TCP-2 ── DB shard 2
+```
+
+- Fewer connections (each TCP server has one pool, not N pools).
+- **But:** a hot shard = a hot TCP server. They're the same bottleneck. Cannot
+  add TCP capacity without adding DB capacity.
+- **But:** failover is hard. TCP-1 dies → shard 1 is unreachable. A "fallback"
+  TCP server for shard 1 needs its own pool to shard 1's DB, which is just
+  Option A with extra steps.
+- **But:** requires the HTTP server (or a gateway in front) to become an
+  application-aware router:
+  - Parse the HTTP body to extract the username or session token
+  - Query the username lookup or Redis to resolve to a user_id
+  - Compute `ShardFor(user_id)` to pick the right TCP server
+  - Handle routing for post-login requests (resolve session token → user_id →
+    shard → TCP server) on every single request
+  - This is no longer a load balancer — it's a full application-aware proxy with
+    its own failure modes, harder to test, and more critical to uptime.
+
+**Why Option A wins:** the connection count concern is the only real cost, and
+it's trivially small compared to the operational complexity of building an
+application-aware routing proxy. The decoupled scaling and free failover are
+worth far more than saving a few dozen DB connections.
+
+---
+
+### 13.7 Schema Changes for Sharding
+
+**Per-shard `users` table** — identical to the current schema except `id` is no
+longer `AUTO_INCREMENT`:
+
+```sql
+CREATE TABLE users (
+  id             BIGINT UNSIGNED NOT NULL,       -- snowflake ID, app-generated
+  username       VARCHAR(32)  NOT NULL,
+  password_hash  VARBINARY(60) NOT NULL,
+  nickname       VARCHAR(128) NOT NULL,
+  avatar_suffix  CHAR(8)      NULL,
+  row_version    BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_username (username)              -- safety net within-shard; global uniqueness via lookup
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+```
+
+**Global lookup table** (unsharded, separate instance):
+
+```sql
+CREATE TABLE username_lookup (
+  username  VARCHAR(32)      NOT NULL,
+  user_id   BIGINT UNSIGNED  NOT NULL,
+  PRIMARY KEY (username)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+```
+
+**What changes in Go code:**
+
+- **ID generation:** `InsertUser` no longer reads `LastInsertId()`. The app
+  generates the snowflake ID before insert and passes it in. A new
+  `idgen.Generator` struct holds the machine ID and sequence counter.
+- **Shard routing:** `db.Handle` becomes a shard-aware type: a slice of pools +
+  a `ShardFor(userID) int` function (consistent hash, binary search on vnodes)
+  that picks which pool to use per query.
+- **Login path:** `lookupUserForLogin` hits the username lookup first to get
+  `user_id`, then routes to the correct shard for the full row. The auth cache
+  already carries `id` in `model.AuthCached`, so a cache hit still skips the
+  full-row MySQL query — it just needs the lookup for routing.
+- **Signup path:** generates snowflake ID, inserts into lookup (catches global
+  duplicates), then inserts into the shard. On shard-insert failure, deletes
+  from lookup (rollback).
+
+**What stays unchanged:**
+
+- `row_version`, `avatar_suffix`, the `LAST_INSERT_ID(row_version+1)` trick —
+  all operate on a single row by ID on one shard.
+- Cache keys (`auth:<username>`, `{user:<id>}`, `sess:<token>`) — keyed by
+  username or user_id, not by shard. Redis doesn't care which MySQL instance the
+  data came from.
+- Lock stack write path (lock → DEL → DB UPDATE → write-through → unlock) —
+  operates on the same `{user:<id>}` key regardless of which shard the write
+  went to.
+- Session model — carries `user_id` only, shard-agnostic.
+- File-first avatar ordering — writes to local filesystem, then updates one row
+  by ID on one shard. The filesystem sharding (`user_id & 0x1FFF`) is orthogonal
+  to DB sharding.
+
+---
+
+### 13.8 Migration — Adding a Shard Without Downtime
+
+Adding a new DB shard mid-flight is the operationally hardest part. With
+consistent hashing, ~1/N of users need to move. The standard approach has
+phases:
+
+**Phase 0 — Before:** all traffic uses the current consistent hash ring (e.g.
+3 shards). The new shard (shard 3) exists but has no data and no traffic.
+
+**Phase 1 — Dual-write, read-old:**
+```
+Write path:  compute old_shard = ShardFor_v1(user_id)
+             compute new_shard = ShardFor_v2(user_id)
+             write to BOTH (old first, new second)
+Read path:   still reads from old_shard only
+```
+New writes land in both places. Reads are still correct because old shard has
+everything. Users that didn't move under the new hash are writing to the same
+shard twice (old == new), which is idempotent for INSERT and fine for UPDATE.
+
+**Phase 2 — Backfill:** a background job copies all historical rows that moved
+under the new hash from old shard → new shard. This is an idempotent upsert by
+PK. Can take hours for millions of rows but causes zero downtime — it's just
+background writes. The dual-write from phase 1 ensures nothing written during
+the backfill is missed.
+
+**Phase 3 — Dual-write, read-new:**
+```
+Write path:  still writes to both
+Read path:   switches to new_shard (using ShardFor_v2)
+```
+Grayscale this: 1% of reads from the new routing, then 10%, then 50%, then 100%.
+Monitor error rates at each step. This is a canary rollout — feature-flagged in
+the shard routing layer (the `ShardFor` function checks a migration-phase config
+value), not in the handlers themselves.
+
+**Phase 4 — Cutover:** stop writing to old shard locations for moved users.
+Remove old shard routing code. Done.
+
+**Where the complexity lives:** `ShardFor(userID)` becomes
+`ShardFor(userID, migrationPhase)` during the transition. The handlers don't
+change — they still call `db.GetUserByID` etc. — but the pool router underneath
+knows to dual-write or to read from the new location. Once migration is
+complete, the phase flag is removed and `ShardFor` returns to a simple hash.
+
+**Alternative approach (read-old, write-new):** similar to above but the read
+path stays on the old shard longer, while new writes go only to the new shard.
+This requires the backfill to complete before reads can switch, whereas the
+dual-write approach allows reads to switch as soon as the backfill covers the
+rows that moved. The dual-write approach is more complex but has a shorter
+total migration window.
+
+**Zero downtime?** Yes, if the phases are implemented correctly. The user never
+sees an error. During the backfill window, a user might read slightly stale data
+if they're reading from an old shard while a new write went to the new shard,
+but this is the dual-write phase where writes go to both, so it doesn't arise.
+
+---
+
+### 13.8.1 Rate Limiting in the Sharded Context
+
+Rate limiting in the sharded context follows the same design and shelved status
+as §4.8; no additional sharding-specific rate limiting concerns arise. The Redis
+counters (`rl:login:ip:<ip>`, `rl:login:user:<username>`) are keyed by IP or
+username, not by shard, so they work identically regardless of how many data
+shards exist. When implemented, the enforcement point is still the TCP server
+login handler, before bcrypt.
+
+---
+
+### 13.9 Availability vs. Sharding (Separate Concerns)
+
+**Status: shelved — considered and documented but not implemented.** Same
+rationale as rate limiting (§4.8): the current design accepts replicas cleanly
+without restructuring (see below), and building replication infrastructure for a
+localhost entry task with one MySQL instance is out of scope.
+
+Sharding solves **load distribution**, not **availability**. A shard going down
+takes its subset of users offline — sharding actually increases the blast radius
+per-instance compared to a single DB (a fraction of users down vs degraded
+performance for all), but reduces load per instance so each one is less likely to
+fail under pressure. They are independent axes that compose:
+
+```
+TCP servers (any can reach any shard, round-robin)
+    │
+    ├── Shard 0:  Primary ←→ Replica  (failover via replication)
+    ├── Shard 1:  Primary ←→ Replica
+    └── Shard 2:  Primary ←→ Replica
+```
+
+| Concern | Who handles it | What the Go code does |
+|---|---|---|
+| Shard routing | App code (`ShardFor(userID)`) | Picks which pool to use |
+| Primary down | MySQL replication + orchestrator (ProxySQL, Vitess, etc.) | DNS/VIP flips to replica; pool reconnects on next `Acquire` (existing `isBadConn` retry handles this) |
+| Adding a shard | App code (update consistent hash ring) + migration (§13.8) | Add a new pool entry, run dual-write migration |
+| Read scaling | Read replicas per shard | Optional read-only pool per shard; route SELECTs there, UPDATEs to primary |
+
+#### Replication Modes and Staleness Guarantees
+
+| Mode | Data loss on failover | Read-from-replica staleness | How it works |
+|---|---|---|---|
+| Async (MySQL default) | Possible (unreplicated writes lost) | Unbounded (seconds of lag possible) | Primary commits, ships binlog asynchronously. Replica applies whenever it gets around to it. |
+| Semi-sync | None (≥1 replica ACKs before commit) | Still present (ACK = received, not applied) | Primary waits for ≥1 replica to ACK receipt of the binlog before returning OK to the client. But "receipt" ≠ "applied" — the replica may not have replayed it yet. |
+| Group Replication (Paxos-based) | None (majority consensus) | Still present on secondaries (log replay lag) | MySQL's built-in consensus protocol. Leader proposes → majority ACK → commit. Guarantees log consistency across a majority, but applying the log to state still has a replay lag on followers. |
+
+**Key insight:** replication guarantees consistency of the **log**, not
+zero-staleness of **reads from followers.** Raft/Paxos ensure every node agrees
+on the order of operations, but a follower that hasn't finished replaying the
+latest committed entry still serves stale data if you read from it.
+
+For zero-stale reads: **read from the primary.** This always works but defeats
+the point of read replicas for that query.
+
+**"Read your own writes" pattern** — the practical middle ground:
+```
+1. User updates nickname → write goes to primary, gets back GTID (transaction ID)
+2. Next read from this user → pass GTID to the replica:
+   "wait until you've replayed up to this transaction"
+   (MySQL: WAIT_FOR_EXECUTED_GTID_SET(gtid, timeout))
+3. Replica either catches up (typically ms) or times out → fall back to primary
+```
+The user who just edited always sees their own change; everyone else tolerates a
+brief lag. This is how large-scale read replicas work without sacrificing the
+"I just changed my nickname but it shows the old one" experience.
+
+**For this system:** DB shards each have a single primary (no replicas yet), so
+DB-level staleness isn't a concern — every read hits the primary. The lock stack's
+`row_version` + version-in-value cache design already handles the **cache**
+staleness problem (the same class of issue, just at the Redis layer instead of the
+DB layer). If read replicas were added per shard, `GetUserByID` could route to a
+replica and `UpdateNickname` to the primary — the lock stack cache design would
+still work identically, since the cache is populated from whichever source
+answered, and a stale replica would just produce a cache entry with a lower
+version that the lock stack's Lua compare-and-SET would reject if a newer version
+arrived.
+
+---
+
+### 13.10 Implementation Status
+
+Implemented. The sharding design above is fully wired:
+
+**Lookup shards:** 2 shards (`lookup_0`, `lookup_1`), routed by
+`hash(username) % 2`. Global username uniqueness enforced per-shard via PK
+constraint. Each holds ~50% of the username→user_id mappings. Configured via
+`LOOKUP_SHARD_DSNS` in `.env`.
+
+**Data shards:** 2 shards (`data_0`, `data_1`), routed by consistent hash ring
+with 150 vnodes per shard (`SHARD_VNODES`). Scalable to 3+ via the migration
+phases in §13.8. Configured via `DATA_SHARD_DSNS` in `.env`.
+
+**ID generation:** snowflake IDs via `internal/idgen`, machine ID from
+`MACHINE_ID` env var.
+
+**Localhost setup:** all shards are separate MySQL schemas (databases) on the
+same mysqld instance(s). The Go code doesn't know or care whether pools point at
+different ports or different database names on the same port — the routing,
+sharding, and migration logic is identical either way. The only thing this
+doesn't demonstrate is physical load isolation between shards, which isn't
+meaningful on localhost since they share the same CPU, disk, and buffer pool.
+
+See §14 for the full configuration reference.
+
+---
+
+## 14. Configuration / Environment Variables
+
+All configuration is loaded from environment variables, with `.env` file support
+(see `internal/config/config.go`). Real env vars take precedence over `.env`.
+See `.env.example` for a complete template.
+
+### HTTP Server
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `HTTP_ADDR` | `:8080` | HTTP listen address |
+| `HTTP_TCP_POOL_SIZE` | `8` | Number of persistent TCP connections to the backend |
+| `WEB_ROOT` | `web` | Directory for static assets (HTML/JS) |
+| `HTTP_READ_HEADER_TIMEOUT_SECONDS` | `5` | |
+| `HTTP_READ_TIMEOUT_SECONDS` | `15` | |
+| `HTTP_WRITE_TIMEOUT_SECONDS` | `15` | |
+| `HTTP_IDLE_TIMEOUT_SECONDS` | `60` | |
+
+### TCP Server
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `TCP_LISTEN` | `:9000` | TCP listen address |
+
+### MySQL Sharding
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `DATA_SHARD_DSNS` | `app:app@tcp(.../data_0),app:app@tcp(.../data_1)` | Comma-separated DSNs for data shards |
+| `LOOKUP_SHARD_DSNS` | `app:app@tcp(.../lookup_0),app:app@tcp(.../lookup_1)` | Comma-separated DSNs for lookup shards |
+| `SHARD_VNODES` | `150` | Virtual nodes per shard in the consistent hash ring |
+| `MYSQL_DATA_MAX_OPEN` | `10` | Max open connections per data shard pool |
+| `MYSQL_DATA_MAX_WAIT_MS` | `200` | Max wait time for a connection from data pool |
+| `MYSQL_DATA_CONN_MAX_LIFETIME_SECONDS` | `300` | |
+| `MYSQL_DATA_MAX_IDLE_TIME_SECONDS` | `120` | |
+| `MYSQL_DATA_SWEEP_INTERVAL_SECONDS` | `30` | Idle connection sweeper interval |
+| `MYSQL_DATA_MAX_BAD_CONN_RETRIES` | `3` | |
+| `MYSQL_LOOKUP_MAX_OPEN` | `5` | Max open connections per lookup shard pool |
+| `MYSQL_LOOKUP_MAX_WAIT_MS` | `200` | |
+| `MYSQL_LOOKUP_CONN_MAX_LIFETIME_SECONDS` | `300` | |
+| `MYSQL_LOOKUP_MAX_IDLE_TIME_SECONDS` | `120` | |
+| `MYSQL_LOOKUP_SWEEP_INTERVAL_SECONDS` | `30` | |
+| `MYSQL_LOOKUP_MAX_BAD_CONN_RETRIES` | `3` | |
+
+> **Note:** `.env.example` uses `SHARD_DATA_MAX_OPEN` and `SHARD_LOOKUP_MAX_OPEN`
+> but `config.go` reads `MYSQL_DATA_MAX_OPEN` and `MYSQL_LOOKUP_MAX_OPEN`. The
+> `.env.example` names are not loaded by the config loader — this is a mismatch
+> that should be reconciled (either rename the env vars in `.env.example` or
+> update `config.go`).
+
+### ID Generation
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `MACHINE_ID` | `0` | Snowflake machine ID (0–1023). Must be unique per TCP server instance. |
+
+### Redis
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `REDIS_ADDR` | `127.0.0.1:6379` | Redis address |
+| `REDIS_PASSWORD` | (empty) | Redis auth password |
+| `REDIS_DB` | `0` | Redis database index |
+| `REDIS_POOL_SIZE` | `50` | go-redis connection pool size |
+| `REDIS_MIN_IDLE_CONNS` | `10` | Minimum idle connections kept warm |
+| `REDIS_CONN_MAX_LIFETIME_SECONDS` | `1800` | |
+| `REDIS_POOL_TIMEOUT_MS` | `200` | |
+| `REDIS_IO_TIMEOUT_MS` | `500` | |
+| `REDIS_PING_TIMEOUT_SECONDS` | `2` | |
+| `CACHE_LAYER` | `on` | Set to `off` to disable user/profile cache (for perf baseline) |
+| `CACHE_AUTH_TTL_SECONDS` | `600` | TTL for `auth:<username>` keys |
+| `CACHE_USER_TTL_SECONDS` | `3600` | TTL for `{user:<id>}` keys (also used as lock stack cache TTL fallback) |
+| `CACHE_LOOKUP_TTL_SECONDS` | `600` | TTL for `lookup:<username>` keys |
+
+### Lock Stack
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `LOCKSTACK_LOCK_TTL_MS` | `2000` | Per-key write lock TTL (watchdog extends while writer is alive) |
+| `LOCKSTACK_LEASE_TTL_MS` | `500` | Reader lease TTL (must be > DB query timeout) |
+| `LOCKSTACK_CACHE_TTL_SECONDS` | `3600` | TTL for cache entries written by the lock stack |
+| `LOCKSTACK_POLL_MIN_US` | `500` | Initial backoff for reader polling (microseconds) |
+| `LOCKSTACK_POLL_MAX_US` | `4000` | Maximum backoff cap for reader polling (microseconds) |
+| `LOCKSTACK_MAX_LOCK_RETRIES` | `200` | Max attempts to acquire the write lock before failing |
+
+### Uploads
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `UPLOADS_ROOT` | `uploads` | Root directory for avatar file storage |
+| `UPLOADS_MAX_BYTES` | `2097152` | Max upload size (2 MB) |
+
+### Bcrypt
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `BCRYPT_COST` | `5` | Must match cost used by the seeder (§4.3, §7) |
+
+### Sessions
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `SESSION_TTL_SECONDS` | `86400` | Session lifetime (24h), refreshed by sliding window |
