@@ -342,3 +342,55 @@ Status Codes  [code:count]                      200:80823  500:7924
 Error Set:
 500 Internal Server Error
 ```
+
+
+
+
+
+### v2
+
+- ### vegeta report loadtest/results/noCache_cost5_result_v2.bin
+```
+vegeta report loadtest/results/noCache_cost5_result_v2.bin
+Requests      [total, rate, throughput]         90001, 2999.99, 2999.70
+Duration      [total, attack, wait]             30.003s, 30s, 2.871ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  1.8ms, 10.183ms, 4.728ms, 12.896ms, 31.625ms, 147.591ms, 353.49ms
+Bytes In      [total, mean]                     1788314, 19.87
+Bytes Out     [total, mean]                     4680052, 52.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:90001  
+Error Set:
+```
+
+- ### vegeta report loadtest/results/yesCache_cost5_result_v2.bin
+```
+vegeta report loadtest/results/yesCache_cost5_result_v2.bin
+Requests      [total, rate, throughput]         89999, 2999.94, 2999.69
+Duration      [total, attack, wait]             30.003s, 30s, 2.523ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  1.709ms, 6.802ms, 4.297ms, 9.217ms, 15.781ms, 71.092ms, 198.751ms
+Bytes In      [total, mean]                     1788280, 19.87
+Bytes Out     [total, mean]                     4679948, 52.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:89999  
+Error Set:
+```
+
+latency drop, loook at p90, p95, p99 and max (biggest impact)
+
+REDIS:
+
+keyspace_hits:421869
+keyspace_misses:2539
+
+to
+
+keyspace_hits:511666
+keyspace_misses:2741
+
+change is 89797, 202
+
+so
+
+keyspace_hits:89797
+keyspace_misses:202
+total: 89999 (matches up)
