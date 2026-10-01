@@ -7,50 +7,46 @@
 package db
 
 import (
-	"hash/fnv"
-
 	"entry_profile_creation/internal/sharding"
 )
 
-// ShardedHandle is the top-level type that replaces the single *Pool in the
-// TCP server. It routes queries to the correct shard pool.
-type ShardedHandle struct {
-	dataShards   []*Pool
-	lookupShards []*Pool
-	ring         *sharding.Ring
+type shardSet struct {
+	pools []*Pool
+	ring  *sharding.Ring
 }
 
-// NewShardedHandle builds a shard-aware handle from pre-opened pools.
-func NewShardedHandle(dataShards []*Pool, lookupShards []*Pool, ring *sharding.Ring) *ShardedHandle {
+type ShardedHandle struct {
+	data   shardSet // keyed by user_id
+	lookup shardSet // keyed by username
+}
+
+func NewShardedHandle(dataPools, lookupPools []*Pool, vnodes int) *ShardedHandle {
 	return &ShardedHandle{
-		dataShards:   dataShards,
-		lookupShards: lookupShards,
-		ring:         ring,
+		data:   shardSet{dataPools, sharding.NewRing(len(dataPools), vnodes)},
+		lookup: shardSet{lookupPools, sharding.NewRing(len(lookupPools), vnodes)},
 	}
 }
 
 // DataShardFor returns the data-shard pool that owns the given userID.
 func (sh *ShardedHandle) DataShardFor(userID uint64) *Pool {
-	return sh.dataShards[sh.ring.ShardFor(userID)]
+	return sh.data.pools[sh.data.ring.ShardFor(userID)]
 }
 
 // LookupShardFor returns the lookup-shard pool for the given username.
 // Uses FNV-1a hash modulo the number of lookup shards.
 func (sh *ShardedHandle) LookupShardFor(username string) *Pool {
-	h := fnv.New32a()
-	h.Write([]byte(username))
-	return sh.lookupShards[int(h.Sum32())%len(sh.lookupShards)]
+	return sh.lookup.pools[sh.lookup.ring.ShardForString(username)]
 }
 
 // Close shuts down all data and lookup shard pools.
 func (sh *ShardedHandle) Close() error {
 	var firstErr error
-	for _, p := range sh.dataShards {
+	for _, p := range sh.data.pools {
 		if err := p.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
-	for _, p := range sh.lookupShards {
+	for _, p := range sh.lookup.pools {
 		if err := p.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -60,11 +56,10 @@ func (sh *ShardedHandle) Close() error {
 
 // DataShards returns the underlying data shard pools (for the seeder and
 // migration tooling that need to iterate all shards).
-func (sh *ShardedHandle) DataShards() []*Pool { return sh.dataShards }
+func (sh *ShardedHandle) DataShards() []*Pool { return sh.data.pools }
 
 // LookupShards returns the underlying lookup shard pools.
-func (sh *ShardedHandle) LookupShards() []*Pool { return sh.lookupShards }
+func (sh *ShardedHandle) LookupShards() []*Pool { return sh.lookup.pools }
 
-// Ring returns the consistent hash ring (for migration tooling that needs
-// to compare old vs new ring placement).
-func (sh *ShardedHandle) Ring() *sharding.Ring { return sh.ring }
+func (sh *ShardedHandle) DataRing() *sharding.Ring   { return sh.data.ring }
+func (sh *ShardedHandle) LookupRing() *sharding.Ring { return sh.lookup.ring }

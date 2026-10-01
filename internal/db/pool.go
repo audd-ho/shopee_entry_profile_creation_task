@@ -12,14 +12,16 @@
 //   - Graceful shutdown: drain in-flight, close idle
 //
 // Public API:
-//   func New(dsn string, maxOpen int) (*Pool, error)
-//   func (p *Pool) Acquire(ctx context.Context) (*Conn, error)
-//   func (p *Pool) Release(*Conn) — called on Conn.Close()
-//   func (p *Pool) Close() error
-//   func (p *Pool) Stats() PoolStats — in-use, idle, waiters, waits, wait_time
+//
+//	func New(dsn string, maxOpen int) (*Pool, error)
+//	func (p *Pool) Acquire(ctx context.Context) (*Conn, error)
+//	func (p *Pool) Release(*Conn) — called on Conn.Close()
+//	func (p *Pool) Close() error
+//	func (p *Pool) Stats() PoolStats — in-use, idle, waiters, waits, wait_time
 //
 // Metrics to expose:
-//   in_use, idle, wait_count, wait_duration, evictions
+//
+//	in_use, idle, wait_count, wait_duration, evictions
 package db
 
 // ---------------------------------------------------------------------------
@@ -49,26 +51,26 @@ import (
 )
 
 const (
-	// maxIdleTime retires connections nobody has used in a while, so a pool
-	// that grew during a spike shrinks back afterwards.
-	maxIdleTime = 2 * time.Minute
+// maxIdleTime retires connections nobody has used in a while, so a pool
+// that grew during a spike shrinks back afterwards.
+//maxIdleTime = 2 * time.Minute
 
-	// sweepInterval is how often the background sweeper looks for stale idle
-	// connections. Eviction is also checked on checkout; the sweeper exists so
-	// an idle pool does not hold dead sockets indefinitely.
-	sweepInterval = 30 * time.Second
+// sweepInterval is how often the background sweeper looks for stale idle
+// connections. Eviction is also checked on checkout; the sweeper exists so
+// an idle pool does not hold dead sockets indefinitely.
+//sweepInterval = 30 * time.Second
 
-	// defaultMaxWait bounds how long Acquire waits for a slot when the pool is
-	// full, if config does not say.
-	defaultMaxWait = 200 * time.Millisecond
+// defaultMaxWait bounds how long Acquire waits for a slot when the pool is
+// full, if config does not say.
+//defaultMaxWait = 200 * time.Millisecond
 
-	// maxBadConnRetries is how many times a query is retried on a fresh
-	// connection after the driver reports the old one unusable.
-	//
-	// Retrying is only safe because driver.ErrBadConn specifically means the
-	// statement never reached the server. Retrying a generic network error
-	// could double-apply an INSERT whose response was merely lost.
-	maxBadConnRetries = 2
+// maxBadConnRetries is how many times a query is retried on a fresh
+// connection after the driver reports the old one unusable.
+//
+// Retrying is only safe because driver.ErrBadConn specifically means the
+// statement never reached the server. Retrying a generic network error
+// could double-apply an INSERT whose response was merely lost.
+// maxBadConnRetries = 2
 )
 
 var (
@@ -96,7 +98,6 @@ type PoolStats struct {
 type Pool struct {
 	connector driver.Connector
 	maxOpen   int
-	maxWait   time.Duration
 
 	// sem is the capacity semaphore: cap(sem) == maxOpen, len(sem) == in use.
 	sem chan struct{}
@@ -112,6 +113,12 @@ type Pool struct {
 
 	stopSweeper chan struct{}
 	sweeperDone chan struct{}
+
+	connMaxLifetime   time.Duration
+	maxIdleTime       time.Duration
+	sweepInterval     time.Duration
+	maxWait           time.Duration
+	maxBadConnRetries int
 }
 
 // New builds a pool from the MySQL config.
@@ -119,8 +126,8 @@ type Pool struct {
 // It does not connect. Connections are dialled lazily on demand, so a pool of
 // 50 does not open 50 sockets at boot for a service that may only ever need
 // three. Open in users.go pings once to fail fast on a bad DSN.
-func New(cfg *config.MySQLConfig) (*Pool, error) {
-	myCfg, err := mysql.ParseDSN(cfg.DSN)
+func New(cfg *config.MySQLPoolConfig, DSN string) (*Pool, error) {
+	myCfg, err := mysql.ParseDSN(DSN)
 	if err != nil {
 		return nil, fmt.Errorf("db: parse dsn: %w", err)
 	}
@@ -133,18 +140,19 @@ func New(cfg *config.MySQLConfig) (*Pool, error) {
 	if maxOpen <= 0 {
 		maxOpen = 1
 	}
-	maxWait := cfg.MaxWait
-	if maxWait <= 0 {
-		maxWait = defaultMaxWait
-	}
 
 	p := &Pool{
 		connector:   connector,
 		maxOpen:     maxOpen,
-		maxWait:     maxWait,
 		sem:         make(chan struct{}, maxOpen),
 		stopSweeper: make(chan struct{}),
 		sweeperDone: make(chan struct{}),
+
+		connMaxLifetime:   cfg.ConnMaxLifetime,
+		maxIdleTime:       cfg.MaxIdleTime,
+		sweepInterval:     cfg.SweepInterval,
+		maxWait:           cfg.MaxWait,
+		maxBadConnRetries: cfg.MaxBadConnRetries,
 	}
 
 	go p.sweep()
@@ -255,7 +263,7 @@ func (p *Pool) popIdle() *Conn {
 		p.idle[len(p.idle)-1] = nil
 		p.idle = p.idle[:len(p.idle)-1]
 
-		if c.expired(now, connMaxLifetime, maxIdleTime) {
+		if c.expired(now, p.connMaxLifetime, p.maxIdleTime) {
 			stale = append(stale, c)
 			continue
 		}
@@ -296,7 +304,7 @@ func (p *Pool) isClosed() bool {
 func (p *Pool) sweep() {
 	defer close(p.sweeperDone)
 
-	ticker := time.NewTicker(sweepInterval)
+	ticker := time.NewTicker(p.sweepInterval)
 	defer ticker.Stop()
 
 	for {
@@ -316,7 +324,7 @@ func (p *Pool) evictStale() {
 	keep := make([]*Conn, 0, len(p.idle))
 	var dead []*Conn
 	for _, c := range p.idle {
-		if c.expired(now, connMaxLifetime, maxIdleTime) {
+		if c.expired(now, p.connMaxLifetime, p.maxIdleTime) {
 			dead = append(dead, c)
 			continue
 		}
@@ -412,7 +420,7 @@ func (p *Pool) ExecContext(ctx context.Context, query string, args ...any) (driv
 		}
 
 		res, err := c.exec(ctx, query, args)
-		if isBadConn(err) && attempt < maxBadConnRetries {
+		if isBadConn(err) && attempt < p.maxBadConnRetries {
 			c.broken = true
 			p.Release(c)
 			continue
@@ -433,7 +441,7 @@ func (p *Pool) QueryRowContext(ctx context.Context, query string, args ...any) *
 		}
 
 		vals, err := c.queryRow(ctx, query, args)
-		if isBadConn(err) && attempt < maxBadConnRetries {
+		if isBadConn(err) && attempt < p.maxBadConnRetries {
 			c.broken = true
 			p.Release(c)
 			continue

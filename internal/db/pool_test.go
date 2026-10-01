@@ -39,7 +39,7 @@ func testPool(t *testing.T, maxOpen int, maxWait time.Duration) *Pool {
 		dsn = defaultTestDSN
 	}
 
-	p, err := New(&config.MySQLConfig{DSN: dsn, MaxOpen: maxOpen, MaxWait: maxWait})
+	p, err := New(&config.MySQLPoolConfig{MaxOpen: maxOpen, MaxWait: maxWait}, dsn)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestEvictStaleRetiresExpiredIdleConnections(t *testing.T) {
 
 	// Backdate the connection past its lifetime instead of waiting minutes.
 	p.mu.Lock()
-	p.idle[0].created = time.Now().Add(-2 * connMaxLifetime)
+	p.idle[0].created = time.Now().Add(-2 * p.connMaxLifetime)
 	p.mu.Unlock()
 
 	p.evictStale()

@@ -1,7 +1,8 @@
 // TODO: Lookup cache helpers (see sharding_design.md §8.3).
 //
 // Key pattern:
-//   lookup:<username> → JSON {user_id}, TTL 10min
+//
+//	lookup:<username> → JSON {user_id}, TTL 10min
 //
 // Write-once data: a username maps to one user_id forever. No versioning,
 // no invalidation needed. SET on signup (after successful insert), populated
@@ -13,15 +14,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const (
-	lookupKeyPrefix = "lookup:"
-	lookupTTL       = 10 * time.Minute
-)
+const lookupKeyPrefix = "lookup:"
 
 func lookupKey(username string) string { return lookupKeyPrefix + username }
 
@@ -56,5 +53,5 @@ func (c *Client) SetLookupCache(ctx context.Context, username string, userID uin
 	if c.userCacheDisabled {
 		return nil
 	}
-	return setJSON(ctx, c, lookupKey(username), &lookupCached{UserID: userID}, lookupTTL)
+	return setJSON(ctx, c, lookupKey(username), &lookupCached{UserID: userID}, c.lookupTTL)
 }

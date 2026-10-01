@@ -3,7 +3,7 @@
 // Value shape: JSON {user_id, username, created_at, ip?, last_seen}
 //
 // Functions:
-//   - CreateSession(ctx, userID, rowVersion, ip) (token string, err error)
+//   - CreateSession(ctx, userID, ip) (token string, err error)
 //       Generate 32-byte random token (via crypto/random.go)
 //       SETEX sess:<token> {...} 24h
 //   - GetSession(ctx, token) (*model.Session, error)
@@ -43,20 +43,7 @@ func sessionKey(token string) string { return sessionKeyPrefix + token }
 
 // CreateSession mints a new session and returns its token, which the HTTP layer
 // sets as a cookie.
-//
-// rowVersion seeds the session's cache-version hint (model.Session.RowVersion)
-// so the very first GetUser call on this session can try the right
-// user:<user_id>:v<N> key instead of guessing. The caller is expected to pass
-// a value freshly read from MySQL at login time (see
-// tcpserver/auth.go:lookupUserForLogin) — never a cached, possibly-stale
-// guess, or the property this buys (the first GetUser call is guaranteed to
-// hit) would not hold.
-//
-// username is not stored on the session at all: unlike an earlier version of
-// this design, no invalidation path needs it any more (see
-// cache/invalidate.go), and get_user's own response reads username from
-// model.UserCached instead. See model.AuthCached/UserCached.
-func (c *Client) CreateSession(ctx context.Context, userID, rowVersion uint64, ip string) (string, error) {
+func (c *Client) CreateSession(ctx context.Context, userID uint64, ip string) (string, error) {
 	token, err := crypto.SessionToken()
 	if err != nil {
 		return "", fmt.Errorf("cache: create session: %w", err)
@@ -64,11 +51,10 @@ func (c *Client) CreateSession(ctx context.Context, userID, rowVersion uint64, i
 
 	now := time.Now().UTC()
 	blob, err := json.Marshal(&model.Session{
-		UserID:     userID,
-		RowVersion: rowVersion,
-		CreatedAt:  now,
-		LastSeen:   now,
-		IP:         ip,
+		UserID:    userID,
+		CreatedAt: now,
+		LastSeen:  now,
+		IP:        ip,
 	})
 	if err != nil {
 		return "", fmt.Errorf("cache: create session: marshal: %w", err)
@@ -138,23 +124,6 @@ func (c *Client) refresh(ctx context.Context, key string, s *model.Session) {
 		return
 	}
 	_ = c.rdb.Set(ctx, key, blob, c.sessionTTL).Err()
-}
-
-// RefreshSessionRowVersion corrects a session's cache-version hint after a
-// GetUserCache guess using it turned out to be stale.
-//
-// A no-op when the hint is already right, which is the common case: this only
-// ever runs on the miss path, right after a MySQL read has supplied the true
-// row_version. Failures are swallowed like every other refresh in this file —
-// the session that was just read is still valid either way, and the cost of a
-// missed correction is one more avoidable cache miss on this session's next
-// read, never wrong data.
-func (c *Client) RefreshSessionRowVersion(ctx context.Context, token string, s *model.Session, rowVersion uint64) {
-	if s.RowVersion == rowVersion {
-		return
-	}
-	s.RowVersion = rowVersion
-	c.refresh(ctx, sessionKey(token), s)
 }
 
 // DeleteSession revokes a session. Deleting a key that does not exist is not an

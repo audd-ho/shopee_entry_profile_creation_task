@@ -68,11 +68,11 @@ type Client struct {
 	rdb        *redis.Client
 	sessionTTL time.Duration
 
-	// userCacheDisabled makes the user:/profile: helpers in user.go report a
-	// miss and skip their writes, leaving sessions untouched. See
-	// config.RedisConfig.UserCacheDisabled for why this is the switch rather
-	// than flushing Redis or pointing at a dead address.
 	userCacheDisabled bool
+
+	authTTL   time.Duration
+	userTTL   time.Duration
+	lookupTTL time.Duration
 }
 
 // New builds a Redis client and verifies connectivity.
@@ -81,7 +81,7 @@ type Client struct {
 // MySQL exercise (phase 4); duplicating it for Redis would buy nothing, since
 // Redis commands are short and the library's pool is already well tuned.
 func New(cfg *config.RedisConfig, sessionTTL time.Duration) (*Client, error) {
-	idle := minIdleConns
+	idle := dur_int(cfg.MinIdleConns, minIdleConns)
 	if cfg.PoolSize < idle {
 		idle = cfg.PoolSize
 	}
@@ -92,15 +92,13 @@ func New(cfg *config.RedisConfig, sessionTTL time.Duration) (*Client, error) {
 		DB:              cfg.DB,
 		PoolSize:        cfg.PoolSize,
 		MinIdleConns:    idle,
-		ConnMaxLifetime: connMaxLifetime,
-		PoolTimeout:     poolTimeout,
-		ReadTimeout:     ioTimeout,
-		WriteTimeout:    ioTimeout,
+		ConnMaxLifetime: dur(cfg.ConnMaxLifetime, connMaxLifetime),
+		PoolTimeout:     dur(cfg.PoolTimeout, poolTimeout),
+		ReadTimeout:     dur(cfg.IOTimeout, ioTimeout),
+		WriteTimeout:    dur(cfg.IOTimeout, ioTimeout),
 	})
 
-	// redis.NewClient, like sql.Open, does not connect. Ping so a wrong address
-	// or password fails at boot instead of on the first login attempt.
-	ctx, cancel := context.WithTimeout(context.Background(), pingTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), dur(cfg.PingTimeout, pingTimeout))
 	defer cancel()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		rdb.Close()
@@ -115,7 +113,24 @@ func New(cfg *config.RedisConfig, sessionTTL time.Duration) (*Client, error) {
 		rdb:               rdb,
 		sessionTTL:        sessionTTL,
 		userCacheDisabled: cfg.UserCacheDisabled,
+		authTTL:           dur(cfg.AuthTTL, 10*time.Minute),
+		userTTL:           dur(cfg.UserTTL, time.Hour),
+		lookupTTL:         dur(cfg.LookupTTL, 10*time.Minute),
 	}, nil
+}
+
+func dur(v, fallback time.Duration) time.Duration {
+	if v > 0 {
+		return v
+	}
+	return fallback
+}
+
+func dur_int(v, fallback int) int {
+	if v > 0 {
+		return v
+	}
+	return fallback
 }
 
 // RDB exposes the underlying Redis client so the lockstack package can share

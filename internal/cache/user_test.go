@@ -255,7 +255,7 @@ func TestUserCacheDisabledKeepsSessionsWorking(t *testing.T) {
 	t.Cleanup(func() { c.Close() })
 	ctx := context.Background()
 
-	token, err := c.CreateSession(ctx, 42, 5, "203.0.113.7")
+	token, err := c.CreateSession(ctx, 42, "203.0.113.7")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -282,12 +282,12 @@ func TestCacheTTLs(t *testing.T) {
 	}
 
 	// Just past the 10-minute auth TTL, well short of the 1-hour user TTL.
-	mr.FastForward(authTTL + time.Second)
+	mr.FastForward(c.authTTL + time.Second)
 
 	if _, hit, _ := c.GetAuthCache(ctx, "alice"); hit {
-		t.Errorf("auth record outlived its %s TTL", authTTL)
+		t.Errorf("auth record outlived its %s TTL", c.authTTL)
 	}
 	if _, hit, _ := c.GetUserCache(ctx, 42, 5); !hit {
-		t.Errorf("user record expired before its %s TTL", userTTL)
+		t.Errorf("user record expired before its %s TTL", c.userTTL)
 	}
 }

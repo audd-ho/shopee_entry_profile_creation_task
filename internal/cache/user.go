@@ -40,20 +40,6 @@ import (
 const (
 	authKeyPrefix = "auth:"
 	userKeyPrefix = "user:"
-
-	// authTTL. The original reasoning for keeping this short was "the value
-	// carries the password hash: a password change that somehow escaped
-	// invalidation must not keep authenticating the old password for long."
-	// There is no change-password feature in this service, so that scenario
-	// cannot currently arise — but the TTL is left at the same value rather
-	// than lengthened, since nothing is gained by holding it longer and it
-	// costs nothing to leave as-is.
-	authTTL = 10 * time.Minute
-
-	// userTTL is long because the value is cosmetic (nickname, avatar) and
-	// every path that changes it deletes the key explicitly. The TTL is only a
-	// backstop for an invalidation that failed.
-	userTTL = time.Hour
 )
 
 // authKey is deliberately unversioned — see the comment on model.AuthCached
@@ -135,7 +121,7 @@ func (c *Client) SetAuthCache(ctx context.Context, username string, a *model.Aut
 	if c.userCacheDisabled {
 		return nil
 	}
-	return setJSON(ctx, c, authKey(username), a, authTTL)
+	return setJSON(ctx, c, authKey(username), a, c.authTTL)
 }
 
 // GetUserCache reads the display record for a user id at a specific
@@ -155,5 +141,5 @@ func (c *Client) SetUserCache(ctx context.Context, userID, rowVersion uint64, u 
 	if c.userCacheDisabled {
 		return nil
 	}
-	return setJSON(ctx, c, userKey(userID, rowVersion), u, userTTL)
+	return setJSON(ctx, c, userKey(userID, rowVersion), u, c.userTTL)
 }

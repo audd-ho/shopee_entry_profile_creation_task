@@ -50,12 +50,7 @@ func NewRing(shardCount, vnodesPerShard int) *Ring {
 	return &Ring{vnodes: vnodes, count: shardCount}
 }
 
-// ShardFor returns the shard index that owns the given key.
-func (r *Ring) ShardFor(key uint64) int {
-	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], key)
-	h := xxhash.Sum64(buf[:])
-
+func (r *Ring) ShardForHash(h uint64) int {
 	idx := sort.Search(len(r.vnodes), func(i int) bool {
 		return r.vnodes[i].hash >= h
 	})
@@ -63,6 +58,18 @@ func (r *Ring) ShardFor(key uint64) int {
 		idx = 0
 	}
 	return r.vnodes[idx].shard
+}
+
+// ShardFor routes an integer key (user_id).
+func (r *Ring) ShardFor(key uint64) int {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], key)
+	return r.ShardForHash(xxhash.Sum64(buf[:]))
+}
+
+// ShardForString routes a string key (username).
+func (r *Ring) ShardForString(key string) int {
+	return r.ShardForHash(xxhash.Sum64String(key))
 }
 
 // ShardCount returns the number of shards in the ring.

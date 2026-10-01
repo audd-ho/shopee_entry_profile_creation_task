@@ -22,7 +22,7 @@ import (
 //
 //	sudo mysql -u root -e "CREATE DATABASE userdb_test CHARACTER SET utf8mb4 COLLATE utf8mb4_bin; \
 //	  GRANT ALL PRIVILEGES ON userdb_test.* TO 'app'@'%';"
-//	mysql -h 127.0.0.1 -u app -papp userdb_test < schema.sql
+//	mysql -h 127.0.0.1 -u app -papp userdb_test < schema_data.sql
 const defaultTestDSN = "app:app@tcp(127.0.0.1:3306)/userdb_test?parseTime=true&charset=utf8mb4"
 
 func testHandle(t *testing.T) Handle {
@@ -37,7 +37,7 @@ func testHandle(t *testing.T) Handle {
 		dsn = defaultTestDSN
 	}
 
-	h, err := Open(context.Background(), &config.MySQLConfig{DSN: dsn, MaxOpen: 16})
+	h, err := Open(context.Background(), dsn, &config.MySQLPoolConfig{MaxOpen: 16})
 	if err != nil {
 		t.Skipf("no MySQL test database reachable (%v); see the setup comment in users_test.go", err)
 	}

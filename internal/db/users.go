@@ -28,7 +28,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/go-sql-driver/mysql"
 
@@ -59,11 +58,11 @@ const mysqlErrDupEntry = 1062
 // connMaxLifetime caps how long a pooled connection is reused. Bounded
 // lifetimes let server-side restarts, failovers and wait_timeout drift resolve
 // themselves instead of surfacing as sporadic "invalid connection" errors.
-const connMaxLifetime = 5 * time.Minute
+//const connMaxLifetime = 5 * time.Minute
 
 // Open builds the pool and verifies it can reach MySQL.
-func Open(ctx context.Context, cfg *config.MySQLConfig) (Handle, error) {
-	p, err := New(cfg)
+func Open(ctx context.Context, dsn string, cfg *config.MySQLPoolConfig) (Handle, error) {
+	p, err := New(cfg, dsn)
 	if err != nil {
 		return nil, err
 	}

@@ -14,13 +14,18 @@
 --   - row_version is unrelated to avatar_suffix: it bumps on ANY mutating write and
 --     exists purely to build/tear down Redis cache keys (§4.1/§4.4.4), never a filename
 
+-- ---------------------------------------------------------------------------
+-- Per-data-shard: users table (id is snowflake, no AUTO_INCREMENT).
+-- Applied to every data shard (data_0, data_1); username_lookup lives on the
+-- lookup shards instead, see schema_lookup.sql.
+-- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS users (
-    id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    id             BIGINT UNSIGNED NOT NULL,              -- snowflake ID, app-generated
     username       VARCHAR(32)     NOT NULL,
     password_hash  VARBINARY(60)   NOT NULL,
     nickname       VARCHAR(128)    NOT NULL,
     avatar_suffix  CHAR(8)         NULL,
-    row_version    BIGINT UNSIGNED NOT NULL DEFAULT 0,  -- bumped on any mutating write; cache-key versioning only (§4.1/§4.4.4 of system_design.md), never used in a filename
+    row_version    BIGINT UNSIGNED NOT NULL DEFAULT 0,    -- bumped on any mutating write; cache-key versioning only (§4.1/§4.4.4 of system_design.md), never used in a filename
     created_at     TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at     TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
