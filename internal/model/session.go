@@ -27,21 +27,6 @@ type Session struct {
 
 	UserID uint64 `json:"user_id"`
 
-	// RowVersion is fetched fresh from MySQL at login (see
-	// tcpserver/auth.go:lookupUserForLogin) — never a stale cache hint — so a
-	// session's first GetUser call always guesses right. Later edits during
-	// the session's lifetime can still make it stale; a GetUser call tries
-	// user:<user_id>:v<RowVersion> first, and if that guess has gone stale it
-	// just misses like any other cache miss, falls through to MySQL, and the
-	// hint gets corrected there (see cache.Client.RefreshSessionRowVersion).
-	// A wrong guess costs one extra miss, never incorrect data.
-	//
-	// Username is deliberately NOT stored here — UserCached (the user: cache)
-	// carries it instead, since get_user has no other reader-side use for a
-	// session field once the two caches are split by purpose (see
-	// model.AuthCached/UserCached).
-	RowVersion uint64 `json:"row_version"`
-
 	CreatedAt time.Time `json:"created_at"`
 
 	// LastSeen is refreshed on activity to drive the sliding-window TTL.

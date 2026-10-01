@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-// User mirrors one row of the `users` table (see schema.sql).
+// User mirrors one row of the `users` table (see schema_data.sql).
 type User struct {
 	ID           uint64
 	Username     string

@@ -51,7 +51,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 
 	"entry_profile_creation/internal/cache"
@@ -152,7 +151,7 @@ func (s *Server) handleLogin(ctx context.Context, d *protocol.LoginData) (*proto
 		return nil, protocol.ErrCodeInternal
 	}
 
-	token, err := s.cache.CreateSession(ctx, user.ID, user.RowVersion, d.IP)
+	token, err := s.cache.CreateSession(ctx, user.ID, d.IP)
 	if err != nil {
 		log.Printf("login: create session for user %d: %v", user.ID, err)
 		return nil, protocol.ErrCodeInternal
@@ -185,7 +184,7 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 	}
 
 	dataPool := s.db.DataShardFor(session.UserID)
-	data, version, err := s.lockstack.Read(ctx, userCacheKey(session.UserID), func(ctx context.Context) ([]byte, int64, error) {
+	data, _, err := s.lockstack.Read(ctx, userCacheKey(session.UserID), func(ctx context.Context) ([]byte, int64, error) {
 		user, err := db.GetUserByID(ctx, dataPool, session.UserID)
 		if err != nil {
 			return nil, 0, err
@@ -211,10 +210,6 @@ func (s *Server) handleGetUser(ctx context.Context, d *protocol.GetUserData) (*p
 	if err := json.Unmarshal(data, &cached); err != nil {
 		log.Printf("get_user: unmarshal cached data for %d: %v", session.UserID, err)
 		return nil, protocol.ErrCodeInternal
-	}
-
-	if session.RowVersion != uint64(version) {
-		s.cache.RefreshSessionRowVersion(ctx, d.Token, session, uint64(version))
 	}
 
 	return &protocol.GetUserResult{
@@ -251,15 +246,7 @@ func (s *Server) lookupUserForLogin(ctx context.Context, username string) (*mode
 	if cached, hit, cErr := s.cache.GetAuthCache(ctx, username); cErr != nil {
 		log.Printf("login: read auth cache for %q: %v", username, cErr)
 	} else if hit {
-		user := cached.User(username)
-
-		rowVersion, err := db.GetRowVersion(ctx, dataPool, user.ID)
-		if err != nil {
-			return nil, fmt.Errorf("login: read row version for user %d: %w", user.ID, err)
-		}
-		user.RowVersion = rowVersion
-
-		return user, nil
+		return cached.User(username), nil
 	}
 
 	user, err := db.GetUserByUsername(ctx, dataPool, username)
