@@ -35,10 +35,10 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	s.http = &http.Server{
 		Addr:              cfg.HTTP.Addr,
 		Handler:           s.buildRouter(),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
+		ReadTimeout:       cfg.HTTP.ReadTimeout,
+		WriteTimeout:      cfg.HTTP.WriteTimeout,
+		IdleTimeout:       cfg.HTTP.IdleTimeout,
 	}
 	return s, nil
 }

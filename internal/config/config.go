@@ -11,30 +11,43 @@ import (
 )
 
 type Config struct {
-	HTTP      HTTPConfig
-	TCP       TCPConfig
-	MySQL     MySQLConfig
-	Shard     ShardConfig
-	IDGen     IDGenConfig
-	Redis     RedisConfig
-	Uploads   UploadsConfig
-	Bcrypt    BcryptConfig
-	Session   SessionConfig
-	LockStack LockStackConfig
+	HTTP            HTTPConfig
+	TCP             TCPConfig
+	MySQLDataPool   MySQLPoolConfig
+	MySQLLookupPool MySQLPoolConfig
+	Shard           ShardConfig
+	IDGen           IDGenConfig
+	Redis           RedisConfig
+	Uploads         UploadsConfig
+	Bcrypt          BcryptConfig
+	Session         SessionConfig
+	LockStack       LockStackConfig
 }
 
 type HTTPConfig struct {
-	Addr        string
-	TCPPoolSize int
-	WebRoot     string
+	Addr              string
+	TCPPoolSize       int
+	WebRoot           string
+	ReadHeaderTimeout time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
 }
 type TCPConfig struct {
 	Addr string
 }
-type MySQLConfig struct {
-	DSN     string
-	MaxOpen int
-	MaxWait time.Duration
+type MySQLPoolConfig struct {
+	MaxOpen           int
+	MaxWait           time.Duration
+	ConnMaxLifetime   time.Duration
+	MaxIdleTime       time.Duration
+	SweepInterval     time.Duration
+	MaxBadConnRetries int
+}
+type ShardConfig struct {
+	DataShardDSNs   []string
+	LookupShardDSNs []string
+	VnodesPerShard  int
 }
 type RedisConfig struct {
 	Addr     string
@@ -44,14 +57,17 @@ type RedisConfig struct {
 
 	// UserCacheDisabled turns off the user:<username> and profile:<user_id>
 	// caches, for the "without cache layer" half of the performance runs.
-	// Sessions are NOT affected: they live in the same Redis but are what
-	// authentication depends on, so disabling them would measure the 401 path
-	// rather than the uncached one.
-	//
-	// Phrased negatively so the zero value leaves the cache ON. A positively
-	// named flag would silently disable the cache in every test and every
-	// caller that builds a RedisConfig without thinking about it.
 	UserCacheDisabled bool
+
+	MinIdleConns    int
+	ConnMaxLifetime time.Duration
+	PoolTimeout     time.Duration
+	IOTimeout       time.Duration
+	PingTimeout     time.Duration
+
+	AuthTTL   time.Duration
+	UserTTL   time.Duration
+	LookupTTL time.Duration
 }
 type UploadsConfig struct {
 	Root     string
@@ -75,15 +91,6 @@ type BcryptConfig struct {
 	Cost int
 }
 
-type ShardConfig struct {
-	DataShardDSNs   []string
-	LookupShardDSNs []string
-	DataMaxOpen     int
-	LookupMaxOpen   int
-	MaxWait         time.Duration
-	VnodesPerShard  int
-}
-
 type IDGenConfig struct {
 	MachineID int
 }
@@ -92,9 +99,12 @@ type SessionConfig struct {
 	TTL time.Duration
 }
 type LockStackConfig struct {
-	LockTTL  time.Duration // default 2s; 0 means use lockstack's built-in default
-	LeaseTTL time.Duration // default 500ms; 0 means use lockstack's built-in default
-	CacheTTL time.Duration // default 1h; 0 means use lockstack's built-in default
+	LockTTL        time.Duration // default 2s; 0 means use lockstack's built-in default
+	LeaseTTL       time.Duration // default 500ms; 0 means use lockstack's built-in default
+	CacheTTL       time.Duration // default 1h; 0 means use lockstack's built-in default
+	PollMin        time.Duration // default 500µs
+	PollMax        time.Duration // default 4ms
+	MaxLockRetries int           // default 200
 }
 
 func Load() *Config {
@@ -102,24 +112,34 @@ func Load() *Config {
 
 	return &Config{
 		HTTP: HTTPConfig{
-			Addr:        envStr("HTTP_ADDR", ""),
-			TCPPoolSize: envInt("HTTP_TCP_POOL_SIZE", 0),
-			WebRoot:     envStr("WEB_ROOT", ""),
+			Addr:              envStr("HTTP_ADDR", ""),
+			TCPPoolSize:       envInt("HTTP_TCP_POOL_SIZE", 0),
+			WebRoot:           envStr("WEB_ROOT", ""),
+			ReadHeaderTimeout: time.Duration(envInt("HTTP_READ_HEADER_TIMEOUT_SECONDS", 0)) * time.Second,
+			ReadTimeout:       time.Duration(envInt("HTTP_READ_TIMEOUT_SECONDS", 0)) * time.Second,
+			WriteTimeout:      time.Duration(envInt("HTTP_WRITE_TIMEOUT_SECONDS", 0)) * time.Second,
+			IdleTimeout:       time.Duration(envInt("HTTP_IDLE_TIMEOUT_SECONDS", 0)) * time.Second,
 		},
 		TCP: TCPConfig{
 			Addr: envStr("TCP_LISTEN", ""),
 		},
-		MySQL: MySQLConfig{
-			DSN:     envStr("MYSQL_DSN", ""),
-			MaxOpen: envInt("MYSQL_MAX_OPEN", 0),
-			MaxWait: time.Duration(envInt("MYSQL_MAX_WAIT_MS", 0)) * time.Millisecond,
-		},
+		MySQLDataPool: MySQLPoolConfig{
+			MaxOpen:           envInt("MYSQL_DATA_MAX_OPEN", 0),
+			MaxWait:           time.Duration(envInt("MYSQL_DATA_MAX_WAIT_MS", 0)) * time.Millisecond,
+			ConnMaxLifetime:   time.Duration(envInt("MYSQL_DATA_CONN_MAX_LIFETIME_SECONDS", 0)) * time.Second,
+			MaxIdleTime:       time.Duration(envInt("MYSQL_DATA_MAX_IDLE_TIME_SECONDS", 0)) * time.Second,
+			SweepInterval:     time.Duration(envInt("MYSQL_DATA_SWEEP_INTERVAL_SECONDS", 0)) * time.Second,
+			MaxBadConnRetries: envInt("MYSQL_DATA_MAX_BAD_CONN_RETRIES", 0)},
+		MySQLLookupPool: MySQLPoolConfig{
+			MaxOpen:           envInt("MYSQL_LOOKUP_MAX_OPEN", 0),
+			MaxWait:           time.Duration(envInt("MYSQL_LOOKUP_MAX_WAIT_MS", 0)) * time.Millisecond,
+			ConnMaxLifetime:   time.Duration(envInt("MYSQL_LOOKUP_CONN_MAX_LIFETIME_SECONDS", 0)) * time.Second,
+			MaxIdleTime:       time.Duration(envInt("MYSQL_LOOKUP_MAX_IDLE_TIME_SECONDS", 0)) * time.Second,
+			SweepInterval:     time.Duration(envInt("MYSQL_LOOKUP_SWEEP_INTERVAL_SECONDS", 0)) * time.Second,
+			MaxBadConnRetries: envInt("MYSQL_LOOKUP_MAX_BAD_CONN_RETRIES", 0)},
 		Shard: ShardConfig{
 			DataShardDSNs:   envCSV("DATA_SHARD_DSNS", nil),
 			LookupShardDSNs: envCSV("LOOKUP_SHARD_DSNS", nil),
-			DataMaxOpen:     envInt("SHARD_DATA_MAX_OPEN", 0),
-			LookupMaxOpen:   envInt("SHARD_LOOKUP_MAX_OPEN", 0),
-			MaxWait:         time.Duration(envInt("SHARD_MAX_WAIT_MS", 0)) * time.Millisecond,
 			VnodesPerShard:  envInt("SHARD_VNODES", 0),
 		},
 		IDGen: IDGenConfig{
@@ -131,6 +151,14 @@ func Load() *Config {
 			DB:                envInt("REDIS_DB", 0),
 			PoolSize:          envInt("REDIS_POOL_SIZE", 0),
 			UserCacheDisabled: envStr("CACHE_LAYER", "") == "off",
+			MinIdleConns:      envInt("REDIS_MIN_IDLE_CONNS", 0),
+			ConnMaxLifetime:   time.Duration(envInt("REDIS_CONN_MAX_LIFETIME_SECONDS", 0)) * time.Second,
+			PoolTimeout:       time.Duration(envInt("REDIS_POOL_TIMEOUT_MS", 0)) * time.Millisecond,
+			IOTimeout:         time.Duration(envInt("REDIS_IO_TIMEOUT_MS", 0)) * time.Millisecond,
+			PingTimeout:       time.Duration(envInt("REDIS_PING_TIMEOUT_SECONDS", 0)) * time.Second,
+			AuthTTL:           time.Duration(envInt("CACHE_AUTH_TTL_SECONDS", 0)) * time.Second,
+			UserTTL:           time.Duration(envInt("CACHE_USER_TTL_SECONDS", 0)) * time.Second,
+			LookupTTL:         time.Duration(envInt("CACHE_LOOKUP_TTL_SECONDS", 0)) * time.Second,
 		},
 		Uploads: UploadsConfig{
 			Root:     envStr("UPLOADS_ROOT", ""),
@@ -143,9 +171,12 @@ func Load() *Config {
 			TTL: time.Duration(envInt("SESSION_TTL_SECONDS", 0)) * time.Second,
 		},
 		LockStack: LockStackConfig{
-			LockTTL:  time.Duration(envInt("LOCKSTACK_LOCK_TTL_MS", 0)) * time.Millisecond,
-			LeaseTTL: time.Duration(envInt("LOCKSTACK_LEASE_TTL_MS", 0)) * time.Millisecond,
-			CacheTTL: time.Duration(envInt("LOCKSTACK_CACHE_TTL_SECONDS", 0)) * time.Second,
+			LockTTL:        time.Duration(envInt("LOCKSTACK_LOCK_TTL_MS", 0)) * time.Millisecond,
+			LeaseTTL:       time.Duration(envInt("LOCKSTACK_LEASE_TTL_MS", 0)) * time.Millisecond,
+			CacheTTL:       time.Duration(envInt("LOCKSTACK_CACHE_TTL_SECONDS", 0)) * time.Second,
+			PollMin:        time.Duration(envInt("LOCKSTACK_POLL_MIN_US", 0)) * time.Microsecond,
+			PollMax:        time.Duration(envInt("LOCKSTACK_POLL_MAX_US", 0)) * time.Microsecond,
+			MaxLockRetries: envInt("LOCKSTACK_MAX_LOCK_RETRIES", 0),
 		},
 	}
 }

@@ -17,14 +17,12 @@ import (
 	"log"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"entry_profile_creation/internal/cache"
 	"entry_profile_creation/internal/config"
 	"entry_profile_creation/internal/db"
 	"entry_profile_creation/internal/idgen"
 	"entry_profile_creation/internal/lockstack"
-	"entry_profile_creation/internal/sharding"
 	"entry_profile_creation/internal/tcpserver"
 )
 
@@ -39,13 +37,10 @@ func main() {
 		log.Fatalf("tcp-server: idgen: %v", err)
 	}
 
-	// --- Consistent hash ring for data shards ---
-	ring := sharding.NewRing(len(cfg.Shard.DataShardDSNs), cfg.Shard.VnodesPerShard)
-
 	// --- Open data shard pools ---
 	dataShards := make([]*db.Pool, len(cfg.Shard.DataShardDSNs))
 	for i, dsn := range cfg.Shard.DataShardDSNs {
-		pool, err := openPool(ctx, dsn, cfg.Shard.DataMaxOpen, cfg.Shard.MaxWait)
+		pool, err := db.Open(ctx, dsn, &cfg.MySQLDataPool)
 		if err != nil {
 			log.Fatalf("tcp-server: data shard %d: %v", i, err)
 		}
@@ -57,7 +52,7 @@ func main() {
 	// --- Open lookup shard pools ---
 	lookupShards := make([]*db.Pool, len(cfg.Shard.LookupShardDSNs))
 	for i, dsn := range cfg.Shard.LookupShardDSNs {
-		pool, err := openPool(ctx, dsn, cfg.Shard.LookupMaxOpen, cfg.Shard.MaxWait)
+		pool, err := db.Open(ctx, dsn, &cfg.MySQLLookupPool)
 		if err != nil {
 			log.Fatalf("tcp-server: lookup shard %d: %v", i, err)
 		}
@@ -66,7 +61,8 @@ func main() {
 		log.Printf("tcp-server: lookup shard %d connected", i)
 	}
 
-	dbh := db.NewShardedHandle(dataShards, lookupShards, ring)
+	// --- Consistent hash ring for data shards ---
+	dbh := db.NewShardedHandle(dataShards, lookupShards, cfg.Shard.VnodesPerShard)
 
 	// --- Redis ---
 	redis, err := cache.New(&cfg.Redis, cfg.Session.TTL)
@@ -77,10 +73,13 @@ func main() {
 
 	// --- Lock stack ---
 	ls, err := lockstack.New(redis.RDB(), lockstack.Config{
-		LockTTL:  cfg.LockStack.LockTTL,
-		LeaseTTL: cfg.LockStack.LeaseTTL,
-		CacheTTL: cfg.LockStack.CacheTTL,
-		Disabled: redis.UserCacheDisabled(),
+		LockTTL:        cfg.LockStack.LockTTL,
+		LeaseTTL:       cfg.LockStack.LeaseTTL,
+		CacheTTL:       cfg.LockStack.CacheTTL,
+		PollMin:        cfg.LockStack.PollMin,
+		PollMax:        cfg.LockStack.PollMax,
+		MaxLockRetries: cfg.LockStack.MaxLockRetries,
+		Disabled:       redis.UserCacheDisabled(),
 	})
 	if err != nil {
 		log.Fatalf("tcp-server: lockstack: %v", err)
@@ -90,14 +89,4 @@ func main() {
 	if err := server.Run(ctx); err != nil {
 		log.Fatalf("tcp-server: %v", err)
 	}
-}
-
-// openPool opens a single MySQL pool for a shard DSN, reusing the existing
-// db.Open mechanism (which pings to fail fast on a bad DSN).
-func openPool(ctx context.Context, dsn string, maxOpen int, maxWait time.Duration) (*db.Pool, error) {
-	return db.Open(ctx, &config.MySQLConfig{
-		DSN:     dsn,
-		MaxOpen: maxOpen,
-		MaxWait: maxWait,
-	})
 }
