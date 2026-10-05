@@ -17,6 +17,7 @@ import (
 	"log"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"entry_profile_creation/internal/cache"
 	"entry_profile_creation/internal/config"
@@ -28,6 +29,9 @@ import (
 
 func main() {
 	cfg := config.Load()
+	if err := cfg.CheckRequestTimeouts(); err != nil {
+		log.Fatalf("tcp-server: %v", err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -73,20 +77,46 @@ func main() {
 
 	// --- Lock stack ---
 	ls, err := lockstack.New(redis.RDB(), lockstack.Config{
-		LockTTL:        cfg.LockStack.LockTTL,
-		LeaseTTL:       cfg.LockStack.LeaseTTL,
-		CacheTTL:       cfg.LockStack.CacheTTL,
-		PollMin:        cfg.LockStack.PollMin,
-		PollMax:        cfg.LockStack.PollMax,
-		MaxLockRetries: cfg.LockStack.MaxLockRetries,
-		Disabled:       redis.UserCacheDisabled(),
+		LockTTL:            cfg.LockStack.LockTTL,
+		WatchdogTTL:        cfg.LockStack.WatchdogTTL,
+		MinWriteBudget:     cfg.LockStack.MinWriteBudget,
+		MaxDeadlockRetries: cfg.LockStack.MaxDeadlockRetries,
+		MaxLockedWait:      cfg.LockStack.MaxLockedWait,
+		CleanupTimeout:     cfg.LockStack.CleanupTimeout,
+		LeaseTTL:           cfg.LockStack.LeaseTTL,
+		CacheTTL:           cfg.LockStack.CacheTTL,
+		PollMin:            cfg.LockStack.PollMin,
+		PollMax:            cfg.LockStack.PollMax,
+		MaxLockRetries:     cfg.LockStack.MaxLockRetries,
+		Disabled:           redis.UserCacheDisabled(),
 	})
 	if err != nil {
 		log.Fatalf("tcp-server: lockstack: %v", err)
 	}
 
 	server := tcpserver.NewServer(cfg, dbh, redis, ls, gen)
+	checkWriteTimeouts(server.RequestTimeout(), ls.Config(), db.EffectiveLockWaitTimeout(cfg.MySQLDataPool.LockWaitTimeout))
 	if err := server.Run(ctx); err != nil {
 		log.Fatalf("tcp-server: %v", err)
+	}
+}
+
+// checkWriteTimeouts refuses to start with lock-stack timeouts that don't nest:
+//
+//	MySQL lock-wait < MinWriteBudget < min(request timeout, WatchdogTTL)
+//
+// A lock-wait at or above MinWriteBudget lets a statement queued in MySQL
+// commit after the write's lease expired (stale cache, nobody to repair it);
+// a MinWriteBudget at or above the write deadline makes every write fail.
+func checkWriteTimeouts(requestTimeout time.Duration, ls lockstack.Config, mysqlLockWait time.Duration) {
+	if ls.Disabled {
+		return
+	}
+	deadline := min(requestTimeout, ls.WatchdogTTL)
+	if mysqlLockWait >= ls.MinWriteBudget {
+		log.Fatalf("tcp-server: MySQL lock-wait timeout %v must be below LOCKSTACK_MIN_WRITE_BUDGET_MS (%v)", mysqlLockWait, ls.MinWriteBudget)
+	}
+	if ls.MinWriteBudget >= deadline {
+		log.Fatalf("tcp-server: LOCKSTACK_MIN_WRITE_BUDGET_MS (%v) must be below the write deadline min(TCP_REQUEST_TIMEOUT_MS, LOCKSTACK_WATCHDOG_TTL_MS) = %v", ls.MinWriteBudget, deadline)
 	}
 }

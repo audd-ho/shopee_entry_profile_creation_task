@@ -868,8 +868,8 @@ sudo systemctl enable --now mysqld@entry_app_shard_instance_1
 sudo systemctl enable --now mysqld@entry_app_shard_instance_2
 ```
 
-* PORT IS 3211 AND 3212
-// thinking of one more shard but independent like maybe 3221 for the lookup schema??
+* Data shards: ports 3211 (data_0) and 3212 (data_1)
+* Lookup shards: ports 3221 (lookup_0) and 3222 (lookup_1)
 
 
 use `getenforce` to check for need of semanage commands, if not then this is it

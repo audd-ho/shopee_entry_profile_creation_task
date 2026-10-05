@@ -65,7 +65,7 @@ func (s *Server) handleUpdateNickname(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.backendTimeout())
 	defer cancel()
 
 	var result protocol.UpdateNicknameResult
@@ -131,7 +131,7 @@ func (s *Server) handleUpdateAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.backendTimeout())
 	defer cancel()
 
 	// Base64 costs a third more bytes on the wire, which is the price of the

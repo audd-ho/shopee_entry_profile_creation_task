@@ -25,7 +25,7 @@
 //	func (p *Pool) Close() error
 //
 // Timeouts:
-//   - Per-request: 2s (context deadline)
+//   - Per-request: HTTP_BACKEND_TIMEOUT_MS, default 5s (context deadline, set by the handlers)
 //   - Reconnect on connection death (drop pending, return error to callers)
 package httpserver
 
@@ -142,14 +142,21 @@ type TCPConnectionPool struct {
 	stopChan chan struct{}
 	wg       sync.WaitGroup
 	closed   atomic.Bool
+
+	// reconnectBackoff is the wait before redialling a dead slot.
+	reconnectBackoff time.Duration
 }
 
-func NewTCPConnectionPool(TCPConnectionAddress string, size int) *TCPConnectionPool {
+func NewTCPConnectionPool(TCPConnectionAddress string, size int, reconnectBackoff time.Duration) *TCPConnectionPool {
+	if reconnectBackoff <= 0 {
+		reconnectBackoff = time.Second
+	}
 	pool := &TCPConnectionPool{
 		ldconns: make([]atomic.Pointer[LockDataTCPConnection], size),
 		// A nil channel makes close(stopChan) panic in Close(), and makes the
 		// <-stopChan cases in the maintainer loops block forever.
-		stopChan: make(chan struct{}),
+		stopChan:         make(chan struct{}),
+		reconnectBackoff: reconnectBackoff,
 	}
 
 	for i := 0; i < size; i++ {
@@ -169,10 +176,10 @@ func (TCPcp *TCPConnectionPool) maintainSlotConnection(slotIdx int, addr string)
 		for {
 			connection, err := NewLockDataTCPConnection(addr)
 			if err != nil {
-				log.Printf("[Pool] Slot %d connection to %s failed: %v. Retrying in 1s...", slotIdx, addr, err)
-				// Sleep 1s, but wake up immediately if pool is closing
+				log.Printf("[Pool] Slot %d connection to %s failed: %v. Retrying in %v...", slotIdx, addr, err, TCPcp.reconnectBackoff)
+				// Sleep, but wake up immediately if pool is closing
 				select {
-				case <-time.After(1 * time.Second):
+				case <-time.After(TCPcp.reconnectBackoff):
 					continue
 				case <-TCPcp.stopChan:
 					log.Printf("[Pool (Retry) ] Slot %d maintainer exiting due to shutdown.", slotIdx)

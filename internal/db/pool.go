@@ -41,6 +41,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -131,6 +132,7 @@ func New(cfg *config.MySQLPoolConfig, DSN string) (*Pool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("db: parse dsn: %w", err)
 	}
+	setLockWaitTimeouts(myCfg, cfg.LockWaitTimeout)
 	connector, err := mysql.NewConnector(myCfg)
 	if err != nil {
 		return nil, fmt.Errorf("db: build connector: %w", err)
@@ -278,6 +280,46 @@ func (p *Pool) popIdle() *Conn {
 		p.evictions.Add(1)
 	}
 	return chosen
+}
+
+// defaultLockWaitTimeout bounds how long a statement may wait on a row or
+// metadata lock. MySQL's own defaults are 50s (innodb_lock_wait_timeout) and
+// one year (lock_wait_timeout); 1s is the lowest either accepts (whole
+// seconds). Must stay below the lock stack's MinWriteBudget.
+const defaultLockWaitTimeout = 1 * time.Second
+
+// setLockWaitTimeouts makes every connection run
+// SET lock_wait_timeout = N, innodb_lock_wait_timeout = N on connect — the
+// driver sends unrecognised DSN params as session variables. A value already
+// given in the DSN wins.
+//
+// This is what keeps a write from committing after the lock stack's lock
+// expired: the lock stack only starts a DB write with at least MinWriteBudget
+// left before its deadline, and a statement queued behind a lock (a
+// migration's metadata lock, a long transaction on the row) fails inside
+// MySQL within this timeout — before the deadline — instead of running later,
+// when the writer that would have refreshed the cache has already given up.
+func setLockWaitTimeouts(myCfg *mysql.Config, d time.Duration) {
+	secs := strconv.Itoa(int(EffectiveLockWaitTimeout(d).Seconds()))
+	if myCfg.Params == nil {
+		myCfg.Params = map[string]string{}
+	}
+	for _, name := range []string{"lock_wait_timeout", "innodb_lock_wait_timeout"} {
+		if _, set := myCfg.Params[name]; !set {
+			myCfg.Params[name] = secs
+		}
+	}
+}
+
+// EffectiveLockWaitTimeout is the session lock-wait timeout a configured
+// value turns into: the default when unset, rounded up to whole seconds
+// (MySQL's unit, minimum 1).
+func EffectiveLockWaitTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		d = defaultLockWaitTimeout
+	}
+	secs := int((d + time.Second - 1) / time.Second)
+	return time.Duration(max(1, secs)) * time.Second
 }
 
 func (p *Pool) dial(ctx context.Context) (*Conn, error) {

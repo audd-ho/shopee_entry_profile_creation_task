@@ -18,6 +18,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"time"
 
 	"entry_profile_creation/internal/cache"
 	"entry_profile_creation/internal/config"
@@ -46,6 +47,21 @@ type Server struct {
 // against substitutes.
 func NewServer(cfg *config.Config, dbh *db.ShardedHandle, redis *cache.Client, ls *lockstack.LockStack, gen *idgen.Generator) *Server {
 	return &Server{cfg: cfg, db: dbh, cache: redis, lockstack: ls, idgen: gen}
+}
+
+// defaultRequestTimeout bounds a request when TCP_REQUEST_TIMEOUT_MS is unset.
+// Below the HTTP side's 5s backend timeout, so an operation ends before the
+// client gives up on it.
+const defaultRequestTimeout = 4 * time.Second
+
+// RequestTimeout is the per-request deadline in effect.
+func (s *Server) RequestTimeout() time.Duration { return s.requestTimeout() }
+
+func (s *Server) requestTimeout() time.Duration {
+	if s.cfg.TCP.RequestTimeout > 0 {
+		return s.cfg.TCP.RequestTimeout
+	}
+	return defaultRequestTimeout
 }
 
 func userCacheKey(userID uint64) string {

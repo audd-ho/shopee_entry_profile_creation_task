@@ -112,9 +112,9 @@ Each subsection: **Options → Considerations → Decision**. Mark decisions wit
 - **DB versioning — implemented as version-in-value via the lock stack**
   - `row_version` column in MySQL bumps on every mutating write
   - Version is embedded in the cached value (`<row_version>\n<JSON>`), not in the key — the key is a single `{user:<id>}` per user
-  - **Write path (lock stack):** lock `{user:<id>}:lock` → DEL `{user:<id>}` (delete-first) → DB UPDATE → Lua `versionSetScript` write-through (version compare-and-SET) → unlock. Writers are serialized by the lock; the Lua script rejects a write if the cache already holds a same-or-newer version
-  - **Read path (lock stack):** GET `{user:<id>}` → hit with real data? serve immediately. Miss or lease value? → `readCheckScript` (atomically check lock + lease) → GRANTED? → DB SELECT → `leaseSetScript` (populate only if lease token still held). Readers blocked by a lock wait for the writer's write-through; readers blocked by another reader's lease wait for its populate
-  - The earlier version-in-key reasoning below is historical — it was superseded by the lock stack design which uses version-in-value + leases to solve the slow-reader overwrite problem (see `lock_stack_implementation_guide.md`)
+  - **Write path (lock stack + lease, lock stored as a writer lease in the slot — M2c, the chosen design):** Lua acquire puts `LW:<writer_id>` into `{user:<id>}` (this is the lock, and it invalidates the slot and voids any reader lease) → DB UPDATE under the write's deadline → Lua finish: version compare-and-SET of the new data, which also unlocks. Writers are serialized by the writer lease; the finish rejects a write if the cache already holds a same-or-newer version
+  - **Read path (lock stack):** GET `{user:<id>}` → hit with real data? serve immediately. Miss or lease value (`LW:`/`LR:`)? → `readCheckScript` (atomically: writer lease → LOCKED, reader lease → LEASED, empty → grant `LR:<token>`) → GRANTED? → DB SELECT → `leaseSetScript` (populate only if the reader lease is still held). Readers blocked by a writer lease wait for the writer's write-through; readers blocked by another reader's lease wait for its populate
+  - The earlier version-in-key reasoning below is historical — it was superseded by the lock stack design which uses version-in-value + leases to solve the slow-reader overwrite problem (see "How the Lock Stack Manages Cache Consistency" below)
 
 **Invalidation strategy — decided:**
 
@@ -149,7 +149,7 @@ Result: DB = "B", Cache = "A"  (divergent until TTL)
 ```
 Delete-on-write is race-safe (deleting is idempotent; next read refetches fresh).
 
-**Decision (historical): Delete-on-write.** The original reasoning below led to delete-on-write as a starting point. **Superseded by the lock stack** (implemented), which combines the best of both: delete-first ordering (safety net from delete-on-write) + lock-protected write-through (no extra DB read on next access) + reader leases (no slow-reader overwrite). See `lock_stack_implementation_guide.md` for the full design.
+**Decision (historical): Delete-on-write.** The original reasoning below led to delete-on-write as a starting point. **Superseded by the lock stack** (implemented), which combines the best of both: delete-first ordering (safety net from delete-on-write) + lock-protected write-through (no extra DB read on next access) + reader leases (no slow-reader overwrite). The full write and read paths are in "How the Lock Stack Manages Cache Consistency" below.
 
 Original delete-on-write reasoning (still valid as background for why the lock stack was needed):
 - **No sync problem:** delete removes the cache entry — there is nothing left to be out of sync with the DB. Write-through keeps data in both DB and cache, so both sides must adhere to the same state; any ordering bug, serialization error, or concurrent-writer race (see above) silently puts them out of sync.
@@ -169,13 +169,13 @@ Read:  GET user:<id>:version → N+1.  GET user:<id> → {data, version: ?}.
 
 Because the counter is incremented before the DB write, any reader during or after the write sees a mismatch and goes to DB — eliminating stale reads entirely.
 
-This is a valid approach, especially for workloads where even ms-level staleness is unacceptable. The implemented lock stack design incorporates elements of this pattern — the writer holds a lock (serializing concurrent writes), uses delete-first ordering as a safety net, then writes through with a Lua version-compare script. On the reader side, leases (M13) prevent slow-reader overwrites. See `lock_stack_implementation_guide.md` for the full design and the failure-mode analysis that led to this combination.
+This is a valid approach, especially for workloads where even ms-level staleness is unacceptable. The implemented lock stack design incorporates elements of this pattern — the writer holds a lock (serializing concurrent writes), uses delete-first ordering as a safety net, then writes through with a Lua version-compare script. On the reader side, leases (M13) prevent slow-reader overwrites. The full write and read paths, timeouts and retry rules are in "How the Lock Stack Manages Cache Consistency" below.
 
 **Invalidation triggers (updated for the lock stack + sharding):**
 
 | Action | Keys invalidated | Mechanism |
 |---|---|---|
-| Nickname update | `{user:<user_id>}` | Lock stack write path (lock → DEL → DB UPDATE → write-through → unlock) |
+| Nickname update | `{user:<user_id>}` | Lock stack write path (writer lease `LW:` = lock + delete-first → DB UPDATE → write-through = unlock) |
 | Avatar update | `{user:<user_id>}` | Lock stack write path (same) |
 | Signup | none (no negative caching) | — |
 | Logout | `sess:<token>` | Plain DEL (no lock stack — session is not version-controlled) |
@@ -565,9 +565,9 @@ Example for user_id = 12345:
    (One statement, one round trip.)
 6. Old files become orphans; async sweeper cleans them up periodically,
    subject to the mtime grace period in 3a — no sweeper implemented yet.
-7. Lock stack write path wraps steps 5–6: lock `{user:<user_id>}:lock` →
-   DEL `{user:<user_id>}` → DB UPDATE → Lua versionSetScript write-through →
-   unlock. `auth:<username>` is NOT touched: it holds nothing an avatar edit
+7. Lock stack write path wraps steps 5–6: writer lease `LW:<writer_id>` into
+   `{user:<user_id>}` (lock + invalidate) → DB UPDATE → Lua write-through
+   (version compare-and-SET, also the unlock). `auth:<username>` is NOT touched: it holds nothing an avatar edit
    could make stale.
 ```
 If step 5 fails, the file written in steps 2-4 is simply an orphan — swept up later, same as any other orphan — and the row is exactly as it was before the request. There is no ordering under which this flow can leave MySQL pointing at a suffix whose file does not exist.
@@ -576,8 +576,9 @@ If step 5 fails, the file written in steps 2-4 is simply an orphan — swept up 
 ```
 1. MySQL: UPDATE users SET nickname = ?, row_version = LAST_INSERT_ID(row_version + 1) WHERE id = ?
    → then SELECT LAST_INSERT_ID() to get new_row_version
-2. Lock stack write path: lock → DEL `{user:<user_id>}` → (DB UPDATE is step 1) →
-   Lua versionSetScript write-through → unlock. `auth:<username>` not touched,
+2. Lock stack write path: writer lease `LW:<writer_id>` into `{user:<user_id>}`
+   (lock + delete-first) → (DB UPDATE is step 1) → Lua write-through, which
+   also unlocks. `auth:<username>` not touched,
    same reasoning as the avatar flow above
 ```
 No file is involved, so unlike the avatar flow there was never a version-vs-suffix
@@ -860,7 +861,7 @@ Ops we'll need:
 
 **Sub-decisions (tune during perf):**
 - Number of persistent TCP connections HTTP→TCP: 8. Confirmed during performance testing — the TCP link is not the bottleneck (multiplexing distributes load across connections, and the bottleneck is bcrypt/DB, not framing).
-- Per-request timeout: 2s.
+- Per-request timeout: 5s on the HTTP side (`HTTP_BACKEND_TIMEOUT_MS`, a context deadline on each call to the TCP server). That deadline doesn't cross the TCP hop, so the TCP server applies its own per-request timeout, 4s (`TCP_REQUEST_TIMEOUT_MS`), just below it — an operation finishes or fails before the HTTP side gives up on it.
 - Reconnect-on-failure is implemented. Proactive health-check pings for idle connections are not — deferred because connections are rarely idle under load, and reconnect-on-failure covers the crash case.
 
 ---
@@ -1005,15 +1006,14 @@ file-first-then-database instead).
 |---|---|---|---|
 | `sess:<token>` | JSON `{user_id, created_at, ip?, last_seen}` | 24h sliding | Session identity. Token is 256-bit random. |
 | `auth:<username>` | JSON `{id, password_hash}` | 10 min | Login auth cache. NOT versioned. |
-| `{user:<user_id>}` | `<row_version>\n<JSON>` (version-in-value) | 1 h | Profile display cache. Managed by lock stack. |
-| `{user:<user_id>}:lock` | `<writer_id>` | LockTTL (2s default) | Lock stack write lock. |
+| `{user:<user_id>}` | `<row_version>\n<JSON>` (version-in-value), or a lease: `LW:<writer_id>` (the write lock, LockTTL) / `LR:<token>` (reader lease, LeaseTTL) | 1 h (data) | Profile display cache. Managed by lock stack; the lock lives in this key — no separate lock key. |
 | `lookup:<username>` | JSON `{user_id}` | 10 min | Username → user_id mapping cache (sharding). |
 | `rl:login:ip:<ip>` | counter | 5 min | Rate limit (shelved). |
 | `rl:login:user:<uname>` | counter | 15 min | Rate limit (shelved). |
 
 **Why `auth:<username>` is unversioned:** `auth:` holds only `id` and `password_hash`, both immutable in the current feature set (no change-password endpoint). It needs no versioning and no invalidation beyond its own TTL. Nickname and avatar edits touch only `{user:<user_id>}` via the lock stack.
 
-**Why `{user:<id>}` uses version-in-value (not version-in-key):** an earlier design used `user:<id>:v<N>` (version-in-key) so the old key became unreachable when `row_version` bumped, without needing a delete to race against a concurrent read. The lock stack design superseded this: the version is now in the **value** (`<row_version>\n<JSON>`), and consistency is maintained by the lock stack's write path (lock → DEL → DB UPDATE → Lua version-compare write-through → unlock) and reader leases (M13). This eliminates the need for the session to carry a `row_version` hint — the reader simply GETs `{user:<id>}` without needing to know the version.
+**Why `{user:<id>}` uses version-in-value (not version-in-key):** an earlier design used `user:<id>:v<N>` (version-in-key) so the old key became unreachable when `row_version` bumped, without needing a delete to race against a concurrent read. The lock stack design superseded this: the version is now in the **value** (`<row_version>\n<JSON>`), and consistency is maintained by the lock stack's write path (writer lease `LW:` in the cache key = lock + delete-first → DB UPDATE → Lua version-compare write-through = unlock) and reader leases (M13). This eliminates the need for the session to carry a `row_version` hint — the reader simply GETs `{user:<id>}` without needing to know the version.
 
 **Cache-key design rationale:**
 
@@ -1106,31 +1106,87 @@ HTTP + TCP protocol interfaces and failure handling for each.
 
 Cache consistency for the `{user:<id>}` key is managed by the lock stack
 (`internal/lockstack`), not by version-in-key or manual goroutine DELs. The
-session does not carry `row_version` — it only holds `user_id`. See
-`lock_stack_implementation_guide.md` for the full design and failure-mode
-analysis.
+session does not carry `row_version` — it only holds `user_id`.
 
-**Write path (nickname update, avatar upload):**
+**Write path (nickname update, avatar upload) — the lock is a writer lease in the cache key (M2c):**
 ```
-1. Acquire lock:  SET {user:<id>}:lock <writer_id> EX <LockTTL> NX
-2. Start watchdog (extends lock TTL while writer is alive)
-3. Save current cache value (for restoration on DB failure)
-4. DEL {user:<id>}  — delete-first ordering (safety net + lease invalidation)
-5. DB UPDATE (row_version bumped atomically)
-6. Lua versionSetScript: compare-and-SET {user:<id>} with new data (write-through)
-7. Release lock (Lua ownership-check DEL)
+0. One deadline for the whole write = min(request timeout 4s, WatchdogTTL 4s), shared by the
+   watchdog and the DB call. The writer lease can't outlive it
+1. Lua acquire: slot holds LW:*? wait and retry. Else SET {user:<id>} LW:<writer_id> PX <LockTTL>
+   — this is the lock, invalidates the slot (delete-first) and voids any reader lease;
+   the old data is returned for restoration
+2. Start watchdog (extends the writer lease while the writer is alive, clipped to the deadline;
+   it only PEXPIREs while the slot still holds this writer's LW:, never SETs)
+3. DB UPDATE (row_version bumped atomically) — started only with ≥ MinWriteBudget (1.5s)
+   left before the deadline (the 4s request timeout); MySQL session lock-wait timeouts
+   (1s) sit below that, so a statement queued behind a lock fails before the lock expires.
+   Deadlock victims are retried (max 2, each budget-gated); nothing else is
+4. Lua finish: version compare-and-SET of the new data — the write-through is also the unlock
+   (overwrites a stray reader lease; skips only another writer's lease or newer data)
+   On a definite DB failure: restore the old data if the writer lease is still ours.
+   On an unknown outcome (deadline, broken connection, error after commit): leave the slot empty.
 ```
 
 **Read path (get_user):**
 ```
-1. GET {user:<id>} → real data (not L: prefix)? serve immediately (M8)
-2. Miss or lease → readCheckScript (atomic: check cache, lock, lease)
+1. GET {user:<id>} → real data (not an LW:/LR: lease)? serve immediately (M8)
+2. Miss or lease → readCheckScript (atomic, one key)
    - HIT:     data appeared while waiting → serve
-   - LOCKED:  writer in progress → poll with backoff, retry
+   - LOCKED:  writer lease in the slot → poll with backoff, retry
    - LEASED:  another reader filling → poll with backoff, retry
-   - GRANTED: we hold the lease → DB SELECT → leaseSetScript (populate if lease survived)
-3. Max wait exceeded → DB SELECT, return without caching
+   - GRANTED: we placed LR:<token> → DB SELECT → leaseSetScript (populate if lease survived)
+3. Max wait exceeded, or only ~LeaseTTL left before the request deadline → DB SELECT,
+   return without caching
 ```
+
+**Timeouts — they must nest** (the TCP server refuses to start otherwise):
+```
+HTTP backendTimeout          5s     client side; doesn't cross the TCP hop
+TCP per-request timeout      4s     the whole operation; the writer lease can't outlive it
+LOCKSTACK_WATCHDOG_TTL       4s     fallback cap when a caller has no deadline
+LOCKSTACK_MIN_WRITE_BUDGET   1.5s   least time left to START a DB write attempt
+MySQL lock-wait timeouts     1s     how long a statement may wait inside MySQL for a row or
+                                    table lock before MySQL aborts it (MySQL's minimum)
+LOCKSTACK_LOCK_TTL           2s     writer lease TTL between watchdog refreshes; crash recovery
+```
+Why `MinWriteBudget` > MySQL lock-wait: once an UPDATE is sent, MySQL may queue it for up
+to its lock-wait timeout. Starting an attempt only with ≥ 1.5s left means it finishes or
+fails while the lease is still held — so nothing can commit after the lock expired (which
+would leave the cache stale with nobody left to refresh it).
+
+**Retries — deadlock victims only:**
+
+| Failure | Retry? | Why |
+|---|---|---|
+| Deadlock (MySQL 1213) | Yes, up to 2, each gated by MinWriteBudget | MySQL rolled the statement back immediately — nothing committed |
+| Lock-wait timeout (1205) | No — error at ~1s | Something outside the lock stack holds the row/table (lock-stack writers are already serialized by `LW:`); a retry would likely wait again |
+| Unknown outcome (deadline passed, connection lost after sending) | Never | It may have committed; the cache slot is left empty |
+| Definite failure (constraint, not found) | Never | It would fail the same way |
+| Bad connection before anything was sent | Already handled | The DB pool retries these; the driver reports `ErrBadConn` only when nothing was sent |
+
+**Network faults:** dropped or delayed packets are retransmitted by TCP and only show up as
+latency (a context error if they hit the deadline). A connection that is already dead before
+sending → `ErrBadConn`, safe to retry. A connection that breaks after the statement was sent,
+or a silent partition (sending succeeds, the reply never comes, ends at the deadline) → unknown
+outcome: no retry, cache left empty. The per-request deadline is what bounds the silent case;
+without it, only TCP keepalive would end it, after minutes.
+
+**Cost** (n_r / n_d = network round trip to Redis / MySQL; u / s = UPDATE / SELECT processing;
+l = Redis Lua processing, microseconds; S = poll slack, the gap between a writer finishing and a
+waiting reader's next poll):
+
+| Path | Cost | Notes |
+|---|---|---|
+| Read, cache hit | n_r | one plain GET |
+| Write | 2n_r + 2l + n_d + u | acquire Lua + UPDATE + finish Lua — 2 Redis round trips, same as a CAS write |
+| Read during a write (blocked) | ≈ 3/2 n_r + 1/2 n_d + 1/2 u + S | waits on Redis, then a cache hit — no DB query |
+| Cold miss, lease holder | ≈ 3n_r + n_d + s | GET + grant + DB read + fill |
+| Cold miss, other readers | ≈ half the holder's fill + S | they wait for its fill — 1 DB read total, not one per reader |
+| Reader that gives up waiting | its wait + n_d + s | uncached DB read |
+
+The watchdog, the deadline / budget check and deadlock retries add nothing on the normal
+path (the watchdog only extends a write that outlives ~LockTTL/3; a retry only follows a
+deadlock).
 
 ---
 
@@ -1494,10 +1550,11 @@ Browser              HTTP Server           TCP Server             Redis         
   │                      │                     │◄─ {user_id: 123}  ─┤                    │
   │                      │                     │                    │                    │
   │                      │                     │  LOCK STACK WRITE: │                    │
-  │                      │                     ├─ SET {user:123}:lock <wid> NX EX 2s ──►│
-  │                      │                     │  (start watchdog)  │                    │
-  │                      │                     ├─ GET {user:123} ──►│  (save for restore)│
-  │                      │                     ├─ DEL {user:123} ──►│  (delete-first)    │
+  │                      │                     ├─ Lua acquire ─────►│  (SET {user:123}   │
+  │                      │                     │                    │   "LW:<wid>" PX 2s:│
+  │                      │                     │                    │   lock + delete-   │
+  │                      │                     │◄─ OK + old data ───┤   first; old data  │
+  │                      │                     │  (start watchdog)  │   kept to restore) │
   │                      │                     │                    │                    │
   │                      │                     │  shard = ShardFor(123)                  │
   │                      │                     ├─ UPDATE users SET nickname = ?, ───────►│
@@ -1505,11 +1562,10 @@ Browser              HTTP Server           TCP Server             Redis         
   │                      │                     │      row_version + 1) WHERE id = 123   │
   │                      │                     │◄── OK + new_row_version ────────────────┤
   │                      │                     │                    │                    │
-  │                      │                     ├─ Lua versionSet ──►│  (write-through:   │
+  │                      │                     ├─ Lua finish ─────►│  (write-through:   │
   │                      │                     │  SET {user:123}    │   version compare  │
-  │                      │                     │  "6\n{...}" EX 1h │   + SET)            │
-  │                      │                     │                    │                    │
-  │                      │                     ├─ Lua lock release ►│  (ownership check) │
+  │                      │                     │  "6\n{...}" EX 1h │   + SET; replacing │
+  │                      │                     │                    │   LW: = unlock)    │
   │                      │                     │  (cancel watchdog) │                    │
   │                      │                     │                    │                    │
   │                      │◄─ success ──────────┤                    │                    │
@@ -1562,7 +1618,8 @@ HTTP responses:
 - Write-through populates cache before unlock — readers after unlock get a cache hit, no DB stampede
 - No session update needed — session does not carry `row_version`
 - `auth:<username>` is NOT touched — it holds nothing a nickname edit could make stale
-- Watchdog extends lock TTL while the writer is alive; if the writer crashes, the lock expires and readers unblock
+- Watchdog extends lock TTL while the writer is alive, never past the write's deadline (min of the 4s request timeout and WatchdogTTL); if the writer crashes, the lock expires and readers unblock; if it hangs, the lock expires at the deadline
+- The DB UPDATE starts only with ≥ MinWriteBudget (1.5s) left; MySQL's 1s lock-wait timeout makes a queued UPDATE fail before the lock expires. Only deadlock victims are retried
 
 ---
 
@@ -1611,9 +1668,9 @@ Browser              HTTP Server           TCP Server             Redis         
   │                      │                     │◄── 6 ───────────────────────────────┤               │
   │                      │                     │                    │                │               │
   │                      │                     │  LOCK STACK WRITE (same as nickname update):           │
-  │                      │                     ├─ lock → save → DEL {user:123} → DB UPDATE ─────────►│
+  │                      │                     ├─ Lua acquire LW: (lock + delete-first) → DB UPDATE ─►│
   │                      │                     │◄── OK + new_row_version ────────────────────────────┤
-  │                      │                     ├─ Lua versionSet write-through → unlock              │
+  │                      │                     ├─ Lua finish: write-through = unlock                  │
   │                      │                     │                    │                │               │
   │                      │◄─ success ──────────┤                    │                │               │
   │◄─ 200 OK ────────────┤                     │                    │                │               │
@@ -1753,8 +1810,7 @@ CREATE TABLE username_lookup (
 |---|---|---|---|
 | `sess:<token>` | `{user_id, created_at, ip, last_seen}` | 24h sliding | Session identity. Token is 256-bit random. |
 | `auth:<username>` | `{id, password_hash}` | 10 min | Login auth cache. NOT versioned. |
-| `{user:<user_id>}` | `<row_version>\n<JSON>` | 1 hr | Profile display cache. Version-in-value, managed by lock stack. May also hold a lease (`L:<token>`) during the miss path. |
-| `{user:<user_id>}:lock` | `<writer_id>` | LockTTL (2s) | Lock stack write lock. Same hash tag as the cache key for Cluster compat. |
+| `{user:<user_id>}` | `<row_version>\n<JSON>` | 1 hr | Profile display cache. Version-in-value, managed by lock stack. May instead hold a lease: `LW:<writer_id>` (the write lock, LockTTL) or `LR:<token>` (reader lease during the miss path, LeaseTTL). No separate lock key. |
 | `lookup:<username>` | `{user_id}` | 10 min | Username → user_id mapping cache (sharding). Immutable once written. |
 
 ### Design Rationale
@@ -1781,16 +1837,18 @@ An earlier design used `user:<id>:v<N>` (version-in-key) so the old key became
 unreachable on bump without needing a delete to race against concurrent reads.
 The lock stack design superseded this: the version is now in the **value**
 (`<row_version>\n<JSON>`), and consistency is maintained by the lock stack's
-write path (lock → DEL → write-through) and reader leases (M13). This
-eliminates the need for the session to carry a `row_version` hint — the reader
-simply GETs `{user:<id>}` without knowing the version. The `{…}` hash tag
-ensures the cache key and its lock key land on the same Redis Cluster slot.
+write path (writer lease `LW:` → write-through = unlock) and reader leases
+(M13). This eliminates the need for the session to carry a `row_version` hint —
+the reader simply GETs `{user:<id>}` without knowing the version. The lock lives
+in the same key (as `LW:<writer_id>`), so every lock-stack script touches one
+key and needs no Redis Cluster hash-tag coordination; the `{…}` braces are kept
+so keys stay stable.
 
 **Invalidation strategy — lock stack (supersedes delete-on-write):**
 
 | Action | Keys invalidated | Mechanism |
 |---|---|---|
-| Nickname update | `{user:<user_id>}` | Lock stack write path (lock → DEL → DB UPDATE → write-through → unlock) |
+| Nickname update | `{user:<user_id>}` | Lock stack write path (writer lease `LW:` = lock + delete-first → DB UPDATE → write-through = unlock) |
 | Avatar update | `{user:<user_id>}` | Lock stack write path (same) |
 | Signup | None | — |
 | Logout | `sess:<token>` | Plain DEL |
@@ -1879,7 +1937,7 @@ the action, and the expected outcome.
 
 | # | Scenario | Action | Expected |
 |---|---|---|---|
-| N1 | Valid update | POST `/api/profile/nickname` `{"nickname": "NewNick"}` with valid session | 200. Lock stack write path: lock → DEL `{user:<id>}` → MySQL UPDATE (row_version N→N+1) → write-through `{user:<id>}` with new data → unlock. |
+| N1 | Valid update | POST `/api/profile/nickname` `{"nickname": "NewNick"}` with valid session | 200. Lock stack write path: writer lease `LW:` into `{user:<id>}` (lock + delete-first) → MySQL UPDATE (row_version N→N+1) → write-through `{user:<id>}` with new data (also the unlock). |
 | N2 | Verify cache populated after update | After N1, check Redis for `{user:<id>}` | Key exists with new data (write-through populated it before unlock). |
 | N3 | Verify next read after update | After N1, GET `/api/me` | Cache hit on `{user:<id>}` — write-through already populated it. No MySQL query needed. |
 | N4 | Empty nickname | `{"nickname": ""}` | 400. Min 1 rune. No DB change. |
@@ -1917,7 +1975,7 @@ the action, and the expected outcome.
 | C2 | User cache TTL | Populate `{user:<id>}`, wait >1 hour | Key expired. Next GET `/api/me` triggers lock stack miss path (readCheck → lease → DB → leaseSet). |
 | C3 | Session sliding window | Active session — make an authenticated request past the halfway mark | Session TTL refreshed to 24h. Requests in the first half do NOT refresh (reduces Redis writes). |
 | C4 | Session TTL expiry | Session idle for >24h | `sess:<token>` expired. Next request returns 401. |
-| C5 | Lock stack version-in-value consistency | Writer updates `{user:123}` from v5→v6 via lock stack | Writer's DEL wipes any outstanding reader lease. Writer's versionSetScript write-through replaces with `"6\n{...}"`. A slow reader holding a lease from before the DEL has its leaseSetScript rejected (lease token gone). No stale data cached. |
+| C5 | Lock stack version-in-value consistency | Writer updates `{user:123}` from v5→v6 via lock stack | Writer's lease (`LW:`) replaces any outstanding reader lease. Writer's version-compare write-through replaces it with `"6\n{...}"`. A slow reader holding a lease from before the writer acquired has its leaseSetScript rejected (lease token gone). No stale data cached. |
 | C6 | Redis down — login still works | Simulate Redis unavailable | Lookup and auth cache misses → fall through to MySQL. Session creation fails → 500 (can't establish session). Login degrades gracefully for cache but requires Redis for session. |
 | C7 | Redis down — profile write | Simulate Redis unavailable during nickname update | Lock stack degrades to Simple: DB UPDATE → best-effort DEL `{user:<id>}`. Correct, brief stale window until TTL or next successful write-through. |
 | C8 | Redis down — profile read | Simulate Redis unavailable during GET `/api/me` | Session GET fails → 401 (can't identify user). Cannot degrade — session is identity. |
@@ -2329,7 +2387,7 @@ CREATE TABLE username_lookup (
 - Cache keys (`auth:<username>`, `{user:<id>}`, `sess:<token>`, `lookup:<username>`) — keyed by
   username or user_id, not by shard. Redis doesn't care which MySQL instance the
   data came from.
-- Lock stack write path (lock → DEL → write-through → unlock), session model
+- Lock stack write path (writer lease `LW:` → write-through = unlock), session model
   (`{user_id, created_at, last_seen, ip}`), file-first avatar ordering — all unchanged.
 - Avatar filesystem sharding (`user_id & 0x1FFF`) — orthogonal to DB sharding.
 
@@ -2405,19 +2463,20 @@ The sharding design above is implemented for this entry task:
 `username_lookup`. Redis `lookup:<username>` cache on top.
 
 **Data shards:** 2 shards (`data_0`, `data_1`), routed by consistent hashing
-(150 vnodes per shard). Scalable to 3+ via the dual-write migration phases
-described in §13.8 of `sharding_implementation.md`.
+(150 vnodes per shard). Scalable to 3+ by adding shards to the ring and
+migrating the keys that move (dual-write during the migration).
 
 **Localhost setup:** all shards are separate MySQL schemas (databases) on
-separate mysqld instances (ports 3211, 3212 — see `sharding_implementation.md`
-§IMPLEMENTATION/SETUP). The Go code connects to each via its own DSN in
+separate mysqld instances — data shards on ports 3211 (`data_0`) and 3212 (`data_1`),
+lookup shards on 3221 (`lookup_0`) and 3222 (`lookup_1`). The Go code connects to each via its own DSN in
 `DATA_SHARD_DSNS` / `LOOKUP_SHARD_DSNS` — the routing, sharding, and migration
 logic is identical whether pools point at different ports or different database
 names on the same port.
 
 **Lock stack:** implemented (`internal/lockstack`), managing the `{user:<id>}`
 cache with version-in-value, reader leases, writer locks with watchdog, and
-Lua scripts for atomic operations. See `lock_stack_implementation_guide.md`.
+Lua scripts for atomic operations — see "How the Lock Stack Manages Cache
+Consistency" above.
 
 **ID generation:** snowflake IDs via `internal/idgen`, configured by `MACHINE_ID`.
 
@@ -2437,14 +2496,18 @@ by `internal/config/config.go`. See `.env.example` for defaults.
 | `WEB_ROOT` | `web` | Static file root for HTML/JS |
 | `HTTP_READ_HEADER_TIMEOUT_SECONDS` | `5` | |
 | `HTTP_READ_TIMEOUT_SECONDS` | `15` | |
-| `HTTP_WRITE_TIMEOUT_SECONDS` | `15` | |
+| `HTTP_WRITE_TIMEOUT_SECONDS` | `15` | Must exceed `HTTP_BACKEND_TIMEOUT_MS` (enforced at startup) |
 | `HTTP_IDLE_TIMEOUT_SECONDS` | `60` | |
+| `HTTP_BACKEND_TIMEOUT_MS` | `5000` | Deadline on each call to the TCP server. Must exceed `TCP_REQUEST_TIMEOUT_MS` (enforced at startup) |
+| `HTTP_SHUTDOWN_TIMEOUT_MS` | `5000` | Graceful-shutdown bound |
+| `HTTP_TCP_RECONNECT_BACKOFF_MS` | `1000` | Wait before redialling a dead TCP connection |
 
 ### TCP Server
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `TCP_LISTEN` | `:9000` | TCP listen address |
+| `TCP_REQUEST_TIMEOUT_MS` | `4000` | Deadline for each request, end to end (below the HTTP side's 5s backend timeout); the lock stack's lease can't outlive it |
 
 ### MySQL Sharding
 
@@ -2457,6 +2520,8 @@ by `internal/config/config.go`. See `.env.example` for defaults.
 | `MYSQL_DATA_MAX_WAIT_MS` | `200` | Max wait for a connection from a data shard pool |
 | `MYSQL_DATA_CONN_MAX_LIFETIME_SECONDS` | `300` | Max lifetime of a connection in a data shard pool |
 | `MYSQL_DATA_MAX_IDLE_TIME_SECONDS` | `120` | Max idle time before a connection is swept |
+| `MYSQL_DATA_LOCK_WAIT_TIMEOUT_SECONDS` | `1` | Session `lock_wait_timeout` + `innodb_lock_wait_timeout` on every data connection (whole seconds, minimum 1). Must stay below `LOCKSTACK_MIN_WRITE_BUDGET_MS`, so a write queued behind a lock fails before the lock stack's lock expires |
+| `MYSQL_LOOKUP_LOCK_WAIT_TIMEOUT_SECONDS` | `1` | Same, for lookup connections |
 | `MYSQL_LOOKUP_MAX_OPEN` | `5` | Max open connections per lookup shard pool |
 | `MYSQL_LOOKUP_MAX_WAIT_MS` | `200` | Max wait for a connection from a lookup shard pool |
 
@@ -2493,11 +2558,21 @@ actual `.env` must use the names that `config.go` reads.
 | Variable | Default | Purpose |
 |---|---|---|
 | `LOCKSTACK_LOCK_TTL_MS` | `2000` | Writer lock TTL. Watchdog extends while alive. |
+| `LOCKSTACK_WATCHDOG_TTL_MS` | `4000` | Most a write can hold the lock when the request's deadline isn't earlier. The lease is clipped to min(request deadline, this), so a hung writer loses the lock exactly then. Raised to LockTTL if lower. |
+| `LOCKSTACK_MIN_WRITE_BUDGET_MS` | `1500` | Least time left before the deadline to start a DB write attempt (else error, nothing sent). Must exceed the MySQL lock-wait timeout |
+| `LOCKSTACK_MAX_DEADLOCK_RETRIES` | `2` | Retries of a DB write MySQL rolled back as a deadlock victim, each gated by the budget. Nothing else is retried |
 | `LOCKSTACK_LEASE_TTL_MS` | `500` | Reader lease TTL. Must be > DB query timeout. |
 | `LOCKSTACK_CACHE_TTL_SECONDS` | `3600` | Cache entry TTL (set on write-through and lease-populate). |
 | `LOCKSTACK_POLL_MIN_US` | `500` | Initial backoff for LOCKED/LEASED polling (0.5ms). |
 | `LOCKSTACK_POLL_MAX_US` | `4000` | Max backoff cap (4ms). |
 | `LOCKSTACK_MAX_LOCK_RETRIES` | `200` | Max retries to acquire the write lock before giving up. |
+| `LOCKSTACK_MAX_LOCKED_WAIT_MS` | `4000` | How long a reader waits on a writer lease before reading the DB uncached (default 2 × LockTTL). Keep below `TCP_REQUEST_TIMEOUT_MS` |
+| `LOCKSTACK_CLEANUP_TIMEOUT_MS` | `2000` | Bound on post-write Redis cleanup (write-through finish, lease release), which runs even after the write's deadline |
+
+In `.env.example` all interacting timeouts sit together in a **Timeouts** section at the
+bottom, with the enforced rules (`HTTP_WRITE > HTTP_BACKEND > TCP_REQUEST`;
+`MySQL lock-wait < MIN_WRITE_BUDGET < min(TCP_REQUEST, WATCHDOG_TTL)`) and the recommended
+ones written out next to the values.
 
 ### Uploads
 

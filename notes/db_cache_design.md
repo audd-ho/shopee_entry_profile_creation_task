@@ -220,8 +220,12 @@ for a hot key or hours for a cold one. Not permanent, but not bounded either.
 | Writer finishes early | Lock held until TTL. Readers blocked unnecessarily. | Released immediately. | Released immediately. |
 | Writer slow (slow DB) | TTL expires mid-write. Lock gone, another writer enters. Defeats the lock. | Never expires. Correct but can't distinguish slow from dead. | Watchdog extends. Correct. |
 | Writer crashes | Lock expires. Readers unblock. Correct. | Lock held forever. Readers starve. | Watchdog stops extending. TTL expires. Safe. |
+| Writer hangs (alive, stuck) | Lock expires. Readers unblock. | Lock held forever. Readers starve. | Uncapped watchdog: extends forever, readers starve. **With WatchdogTTL:** extensions are clipped to the deadline, so the lock expires exactly WatchdogTTL after the write started. Safe. |
 
-Manual unlock + TTL + watchdog is the only variant that handles all cases.
+Manual unlock + TTL + watchdog **capped by WatchdogTTL** is the only variant
+that handles all cases. Without the cap, the watchdog can't tell a slow writer
+from a stuck one — the process (and so the watchdog goroutine) is still alive —
+and a hang starves readers just like manual unlock does. See §11 M3.
 
 ### Watchdog amortization
 
@@ -546,6 +550,25 @@ TTL is configurable — set based on expected write latency (e.g. 500ms–2s).
 Write: SET lock EX <TTL> NX → [locked, expires after TTL] → cache/DB ops → DEL lock
 ```
 
+### M2c: Lock in the slot (writer lease) — variant of M2b
+
+The lock lives in the cache key itself instead of a separate
+`{user:<id>}:lock`: the writer puts `LW:<writer_id>` (with TTL, extended by
+M3) into the same slot that holds data or a reader lease (`LR:<token>`, M13).
+
+```
+Acquire (Lua): slot LW:* → wait; else save old data, SET LW:<id> PX <TTL>
+               (acquiring = invalidating — absorbs M7; overwriting LR: voids
+               the reader lease, so readers never block writers)
+Finish (Lua):  version-compare SET of the new data = unlock (absorbs the
+               separate unlock after M9)
+```
+
+Not a new problem-fixing mechanism — a different place for the lock, which
+fuses steps. **This is how `internal/lockstack` stores its lock.** Same problems fixed as M2b+M3; fewer steps and failure modes, one
+key per slot. A slot can only lock itself (multi-key writes need ordered
+acquisition). Full design, rules and trade-offs: §17b.
+
 ### M3: Watchdog + TTL
 
 A background goroutine (or thread) that periodically extends the lock's TTL
@@ -556,12 +579,41 @@ If the writer crashes, the watchdog stops, and the TTL expires normally.
 
 ```
 Writer goroutine:   SET lock EX <TTL> NX → do work → DEL lock
-Watchdog goroutine: every <TTL/3>: if writer alive → EXPIRE lock <TTL> (reset TTL)
+Watchdog goroutine: every <TTL/3>: if writer alive → EXPIRE lock min(<TTL>, deadline − now)
                     if writer dead → stop extending → TTL expires
+                    deadline = write start + <WatchdogTTL>; last extension lands on it, then stop
 ```
 
 Normal write takes ~2-5ms — watchdog never fires. Watchdog only matters on
 slow writes or crashes.
+
+**WatchdogTTL — a cap on the watchdog itself.** "Writer alive" only covers a
+crash: when the process dies, the watchdog goroutine dies with it. A writer that
+**hangs** (stuck on a DB call, deadlocked, blocked on I/O) keeps its process
+alive, so the watchdog keeps extending the lock forever and readers that miss
+the cache starve (P6 returns). The watchdog can't tell slow from stuck, so it
+gets a deadline of its own, `WatchdogTTL` after the write started.
+
+- **WatchdogTTL is the total hold.** Each extension is
+  `min(LockTTL, deadline − now)`, so no extension ever reaches past the
+  deadline, and once the deadline is closer than LockTTL the last extension
+  lands exactly on it. (Simply stopping at `WatchdogTTL − LockTTL` would be
+  off by up to one tick — TTL/3 — because the watchdog only acts on ticks.)
+- `WatchdogTTL` must be ≥ LockTTL — the initial `SET NX` already holds the lock
+  for LockTTL. A lower value is raised to LockTTL.
+- Set `WatchdogTTL` well above the slowest legitimate write but **at most the
+  request timeout** (4s with a 2s LockTTL and a 4s TCP request timeout, under
+  the HTTP side's 5s): a write still holding the lock after the client gave up
+  serves nobody. With a request deadline the lease is clipped to that instead
+  (§17b), so `WatchdogTTL` is the fallback cap.
+- When it fires, the stuck writer no longer holds the lock. If it later
+  unsticks and writes, that is the "writer paused past its lock TTL" residual
+  risk — the late writer (§17b). The cap trades reader starvation for that
+  rarer case. A shared timeout context (watchdog + DB call) cancels the stuck
+  call at the deadline, and MySQL lock-wait timeouts below MinWriteBudget stop
+  a queued statement committing late (§17b fix 1).
+- A separate watchdog *process* doesn't remove the need for the cap: it also
+  can't tell slow from stuck, so uncapped it starves readers the same way.
 
 ### M4: Version-in-key
 
@@ -597,6 +649,13 @@ Cache population (after DB read):
 
 The Lua script is atomic — Redis executes it without interleaving, so no race
 between the check and the write.
+
+Two things it cannot catch, neither of them the version compare's fault:
+- **A slow reader writing into an empty slot** — nothing to compare against
+  (§17; closed by M13).
+- **A commit that happens after the reader cached** — the late writer (§17b).
+  The reader's version was the latest when it wrote; no check made at cache
+  time can see a future commit.
 
 ### M6: CAS — version counter (INCR → DB → SET)
 
@@ -644,7 +703,16 @@ Reader fill (on miss/mismatch):
   reader saw is unsafe: counter = 6 (INCRed, not committed), MVCC returns v5
   data, reader stores `{6, data5}` → matches → stale. Using the row's own
   `row_version` means pre-commit reads (r=5, counter=6) simply don't cache.
-- **Counter must not go backwards** (rare) — see §13 M6 scenarios.
+- **Writer SETs only on a confirmed 1-row update** — never when the UPDATE
+  matched 0 rows (a version can be reused after a Redis rollback: the SET would
+  label uncommitted data with a version the counter matches), and never on an
+  unknown outcome (timeout mid-COMMIT). A queued late commit is then filled by
+  the next reader. See §13 M6 scenarios.
+- **Fallback reads go to the MySQL primary** — a lagging read replica serves
+  old data (not cached, since its `row_version` won't match, but still served).
+- **Counter must not go backwards** (rare) — failover is stale until the next
+  write attempt (shared with the lock stack); restart/eviction rejects writes
+  until the counter catches up. See §13 M6 scenarios.
 
 ### M7: Delete-first ordering (inside lock)
 
@@ -901,6 +969,12 @@ since before my DB read (every writer DELs first).
   §17 "Lease design concepts".
 - **Does not depend on timing** — stall duration, lock TTL, ≥ vs > no longer
   matter.
+- **Cannot see a commit that happens after the reader cached** (the late
+  writer, §17b). If the writer's lock expired and its commit lands after a
+  reader leased and cached the then-current value, the lease (like any
+  reader-side check, M5 included) has nothing to catch — the reader's data was
+  correct when cached. Not the lease's fault; covered by the writer's
+  write-through, fix 1 in §17b, or binlog invalidation.
 - **One key, one DEL.** The lease lives in the same key as the data; the slot
   holds either data or a lease, never both. The writer's single DEL clears
   whichever is there — no extra command. (A separate lease key would need two
@@ -921,7 +995,8 @@ since before my DB read (every writer DELs first).
 | M1: DB→delete (no lock) | — | P1 (small window), P3 (small stampede) | None — 1 GET | 1 DEL | DEL idempotent, safe | ms stale (P1) |
 | M2a: Lock, manual unlock | P1, P7 | P6 (starvation on crash) | Lock check | SETNX + DEL lock | Held forever on crash | No stale during write |
 | M2b: Lock with TTL | P1, P7, P6 | P8 (expires mid-write) | Lock check | SETNX EX + DEL lock | Expires — safe if TTL > write | No stale during write |
-| M3: Watchdog + TTL | P6, P8 | Complexity | None extra | Periodic extends | Dies → TTL expires → safe | Eliminates P8 risk |
+| M2c: Lock in the slot (writer lease) | P1, P7, P6 (with M3: P8) | Slot locks only itself | None extra (prefix check) | Acquire Lua (= lock + invalidate) + finish Lua (= SET + unlock) | Expires — safe if TTL > write | No stale during write; removes "DEL cache fails" / "DEL lock fails" |
+| M3: Watchdog + TTL (capped by WatchdogTTL) | P6, P8 | Complexity | None extra | Periodic extends, total hold ≤ WatchdogTTL | Dies → TTL expires → safe; hangs → lock expires at WatchdogTTL | Eliminates P8 risk |
 | M4: Version-in-key | P2 | Need version to form key | None if version known | None extra | Old keys linger, harmless | Prevents long stale from P2 |
 | M5: Version-in-value + Lua | P2 (not into an empty slot, §17) | Lua complexity | None — plain GET | Lua EVAL on population | Atomic, safe | Prevents long stale from P2, except empty-slot fill (M13 closes it) |
 | M6: CAS — version counter (INCR→DB→SET) | P1, P2 | P4, P5 | Compare EVERY read (1 MGET) | INCR + SET (+ conditional DB update) | Orphaned version (until next write) | No stale; P5 = fallback until next write |
@@ -1177,7 +1252,8 @@ arrives  ──►  version mismatch?            cache exists?
 | M2b+M3+M5+M7+M10 (+ ver-in-val) | **Fixed** | **Fixed** † | Stampede | Works | No | **Fixed** | **Fixed** | **Fixed** | **Stale possible** † (no write-through: gap after every write) | Yes |
 | M2b+M3+M5+M7+M8+M10 (+ serve-if-exists) | **Fixed** | **Fixed** † | Reduced | Works | No | **Fixed** | **Fixed** | **Fixed** | **Stale possible** † (no write-through: gap after every write) | Yes |
 | M2b+M3+M5+M7+M8+M9+M10 (lock stack (M5)) | **Fixed** | **Fixed** † | **Fixed** | Works | No | **Fixed** | **Fixed** | **Fixed** | **No stale except † gap** (failure cases) | Yes (degrades to M1+M10) |
-| **M2b+M3+M7+M8+M9+M10+M13 (lock stack + lease) — CHOSEN** | **Fixed** | **Fixed** | **Fixed** | Works | No | **Fixed** | **Fixed** | **Fixed** | **No stale** | Yes (degrades to M1+M10) |
+| M2b+M3+M7+M8+M9+M10+M13 (lock stack + lease, separate lock key — superseded by M2c) | **Fixed** | **Fixed** | **Fixed** | Works | No | **Fixed** | **Fixed** | **Fixed** | **No stale** | Yes (degrades to M1+M10) |
+| **M2c+M3+M8+M9+M10+M13 (lock stack + lease, writer lease as the lock) — CHOSEN, implemented** | **Fixed** | **Fixed** | **Fixed** | Works | No | **Fixed** | **Fixed** | **Fixed** | **No stale** (same residuals) | Yes (degrades to M1+M10) |
 | | | | | | | | | | | |
 | *+M12 (singleflight) variants:* | | | | | | | | | | |
 | M1+M10+M4+M12 (Simple+SF) | Small, blast limited | **Fixed** | **Mitigated** | Works when writes rare | No | No | Safe | N/A | **ms only (self-healing)** | No |
@@ -1203,7 +1279,7 @@ write".
 | M1+M10+M4 (+ version-in-key) | P1 only | ms | Yes | Writes fine. No cache. |
 | M6 (CAS) | None. P5 = fallback. | P5: until next write | Yes | Writes blocked. |
 | Lock stack (M5) | Slow reader into empty slot (§17) | Until next DB-sourced populate or CacheTTL | Eventually | Degrades to M1+M10 |
-| **Lock stack + lease — chosen** | **None** | **N/A** | **N/A** | Degrades to M1+M10 |
+| **Lock stack + lease — chosen** | **None** in normal operation. Residuals: late writer (§17b), Redis failover losing recent writes (shared with CAS) — failure model §17c | Until next write / CacheTTL | Next write | Degrades to M1+M10 |
 
 ### Read/write path costs
 
@@ -1214,7 +1290,7 @@ write".
 | M11 (write-through, no lock) | 1 GET | 1 GET (P7 stale possible) | 1 GET miss → DB | DB + 1 SET |
 | Lock stack (M5, invalidate only) | 1 GET | 1 GET → **cache hit** | 1 Lua → block → DB + Lua SET | SETNX + DEL + DB + DEL lock |
 | Lock stack (M5, + write-through) | 1 GET | 1 GET → **cache hit** | 1 Lua → block → **cache hit** | SETNX + DEL + DB + Lua SET + DEL lock |
-| **Lock stack + lease (chosen)** | 1 GET | 1 GET → **cache hit** | 1 GET → readCheck Lua → poll → **cache hit** | SETNX + DEL + DB + Lua SET + DEL lock |
+| **Lock stack + lease (chosen, M2c)** | 1 GET | 1 GET → **cache hit** | 1 GET → readCheck Lua → poll → **cache hit** | Acquire Lua (`LW:` = lock + invalidate) + DB + finish Lua (SET = unlock) |
 | Lock stack + lease, cold miss (no write) | — | — | holder: GET → readCheck (grant) → DB → leaseSet; others: wait → **cache hit** (1 DB read total) | — |
 | | | | | |
 | *+M12 (singleflight) variants:* | | | | |
@@ -1392,28 +1468,111 @@ transport time, which no approach (not even a direct DB read) can avoid.
 In Redis Cluster the two keys need a shared hash tag (`{user:<id>}:version`,
 `{user:<id>}`).
 
-**Counter goes backwards — ABA (rare):**
-```
-The counter is the source of truth for "latest version". If it goes backwards,
-an old cache entry can match again.
+**Counter goes backwards — Redis losing its most recent writes:**
 
-Failover with async replication:
-  Master: counter v10, DB has data10. Replica lagged: counter v8. Cache {v9, data9} survived.
-  Promote replica. Next writer: INCR → v9 → counter v9 == cache v9 → MATCH
-  → serves data9 while DB has data10. STALE.
+"Going backwards" = Redis loses its latest writes and returns to an older
+state, while MySQL (durable) has already moved on. How it happens:
 
-Counter key evicted while cache entries survive:
-  Counter restarts at 1 and climbs. If an old {v57} entry survives until the
-  counter reaches 57 → match → stale. (With a version-compare SET, the new
-  {v1} can't overwrite {v57} → stuck mismatched → cache useless, not stale.)
+- **Failover with async replication.** Redis acknowledges a write before it
+  reaches the replica; if the primary dies in that gap, the promoted replica
+  never got the last commands. Replication is an ordered stream, so the replica
+  holds an exact **prefix** of the primary's history.
+- **Restart without full persistence.** No persistence → all lost; RDB → since
+  the last snapshot; AOF `everysec` → about the last second.
+- **The counter key evicted or deleted** (eviction policy, `FLUSHALL`,
+  operator mistake) while cache entries survive.
+
+What each does to CAS (counter `{user:1}:version`, cache `{user:1}`):
+
 ```
-Rare — needs failover or eviction of the counter key. Mitigations, cheapest
-first:
-- Initialise a missing counter at a **random 64-bit value** (`SET ver <rand> NX`,
-  then INCR) — an old entry's version is vanishingly unlikely to be reached
-  again (same idea as the random lease token).
-- Never evict the counter: no TTL on it + a `volatile-*` eviction policy.
-- Re-seed a missing counter from the DB's `row_version`.
+Failover — the replica lost the last write's INCR and SET:
+  Primary before:  counter 11, cache {11, data11}, DB 11
+  Replica after:   counter 10, cache {10, data10}, DB 11
+  counter == cache version → readers served data10 while DB has data11. STALE.
+  Until the next write ATTEMPT: it INCRs to 11, the DB already has 11 →
+  `WHERE row_version < 11` matches 0 rows → that write is REJECTED (lost) —
+  but counter 11 ≠ cache 10, so readers go to the DB again. (Or until CacheTTL.)
+
+Restart without persistence / counter evicted:
+  Counter missing → INCR → 1, while the DB has row_version 57.
+  Every write rejected (57 < 1 is false) until INCRs climb past 57.
+  Readers never refill (fill needs row_version == counter, 57 ≠ 1).
+  Nothing stale — it fails closed: writes break and the cache is unusable.
+```
+
+**The "ABA" re-match mostly can't happen** with correct CAS. An old cache entry
+surviving at a higher version than a lagging counter needs a SET without the
+INCR before it — impossible on a replica that holds a prefix — and the
+conditional DB update stops the DB moving ahead of a lagging counter. It needs
+the counter and the cache on different nodes (no shared hash tag) or an
+unconditional DB update.
+
+**The failover stale is not CAS-specific.** The lock stack hit by the same
+failover loses its DEL, its write-through SET and its lock; the promoted
+replica serves `{10, data10}` with no lock → stale until the next write or
+CacheTTL ("Redis failover losing a recent DEL", §17 residual risks).
+
+| Redis loses recent writes via… | CAS | Lock stack + lease |
+|---|---|---|
+| Failover (prefix lost) | Stale until the next write attempt; that write is rejected | Stale until the next write / CacheTTL |
+| Restart without persistence / counter evicted | Writes rejected + cache unusable until the counter catches up | Cache empty → readers lease and refill correctly; writes unaffected |
+
+Mitigations:
+- Narrow failover loss: `WAIT 1 <ms>` after critical writes (waits for a
+  replica; adds latency, still not fully synchronous).
+- Narrow restart loss: AOF `appendfsync always` (slow) or `everysec` (~1s).
+- CAS counter: initialise a missing counter from the DB's `row_version` or a
+  **random 64-bit value** (`SET ver <rand> NX`, then INCR) so writes aren't
+  rejected; never evict it (no TTL + a `volatile-*` eviction policy).
+- Both: a short CacheTTL bounds the failover stale; binlog-driven invalidation
+  removes it.
+
+**Can CAS ever serve stale data? The ordering argument, and what breaks it.**
+
+With Redis and MySQL both durable and a correct implementation, no: a commit to
+version v needs the INCR to v first, the counter only moves forward, and a
+matching cache entry can only come from a confirmed commit of v (writer SET) or
+a DB read showing v (reader fill). So `counter == cache.ver` implies no newer
+write has started. Every stale path breaks one of those assumptions:
+
+```
+1. Redis loses recent writes — counter 10, cache {10}, DB 11   (above)
+   Failover drops the INCR to 11 and the SET {11} together (replica = prefix).
+   Shared with the lock stack.
+
+2. Version reused for different data — follows from 1 if the writer is careless
+   After the failover: counter 10, DB row_version 11 (the lost write's data).
+   Next writer: INCR → 11; UPDATE … WHERE row_version < 11 → 0 rows.
+   If it SETs anyway: cache {11, its new data}, counter 11 → MATCH → serves
+   data that never committed.
+   Rule: SET only when the UPDATE affected exactly 1 row. Then the writer skips
+   the SET, readers mismatch, read the DB (row_version 11 == counter 11) and
+   fill the correct data.
+
+3. Writer SETs on an unknown outcome
+   Timeout during COMMIT, SET anyway → {11, new} while the DB may have rolled
+   back → match on uncommitted data.
+   Rule: SET only on confirmed success. A queued late commit is then filled by
+   the next reader (row_version catches up with the counter).
+
+4. MySQL loses a committed write — counter 11, cache {11}, DB 10   (mirror of 1)
+   MySQL primary failover with async replication drops a commit the writer was
+   told succeeded → the DB goes back while counter and cache keep serving data
+   it no longer has. Shared by every design (lock stack write-through, Simple's
+   populate). Fix at the MySQL side: semi-synchronous replication.
+
+5. Fallback reads hit a lagging MySQL read replica
+   The reader is served old data — not cached (the replica's row_version won't
+   match the counter) but served all the same.
+   Rule: zero-stale fallback reads go to the primary. Same for the lock stack's
+   lease reads.
+```
+
+So with both stores durable and a correct implementation, CAS can't serve stale
+data. Its stale paths come from **a store losing acknowledged writes** (1, 4 —
+shared by all designs) or **a broken implementation rule** (2, 3, 5 — the easy
+ones to miss are "SET only on exactly 1 affected row" and "fallback reads go to
+the primary").
 
 ### M11 (write-through, no lock)
 
@@ -1533,9 +1692,14 @@ exception found later: a slow reader writing into the empty slot after the
 writer's write-through fails or the writer dies post-commit. See §17; closed by
 M13 (reader lease).
 
-### M2b+M3+M7+M8+M9+M10+M13 (lock stack + lease — chosen)
+### M2c+M3+M8+M9+M10+M13 (lock stack + lease — chosen)
 
-Same writer path as above (M5 kept on the writer's write-through only). The
+Same writer path as above, with the lock stored as a writer lease in the cache
+slot (M2c): acquiring `LW:<writer_id>` replaces the lock + DEL steps, and the
+version-compare write-through (M5, writer only) replaces the write-through +
+unlock steps. The scenarios below say "DEL" for the step that invalidates the
+slot — in M2c that is placing the writer lease, which voids reader leases the
+same way. The
 reader's miss path changes: GET → readCheck Lua (HIT / LOCKED / LEASED /
 GRANTED) → on GRANTED, fresh DB read → leaseSet (SET only if the slot still
 holds this reader's lease).
@@ -1577,7 +1741,9 @@ Fails: holder releases its lease (check-and-DEL) → a waiter gets GRANTED at on
 ```
 
 **No scenario produces stale data** (under normal Redis operation, with fresh
-DB reads after the grant).
+DB reads after the grant) — except the late writer: a writer whose commit lands
+after its lock expired and that then doesn't write-through (§17b; fix 1 removes
+its likely path).
 
 ---
 
@@ -1913,6 +2079,35 @@ Staleness:       None. At every crash point, cache is either correct or empty.
                  a slow reader can fill with old data — the §17 gap, closed by M13.)
 ```
 
+**Failure 6b: Writer hangs (process alive, writer stuck)**
+
+```
+Cause: writer blocked on a DB call that never returns, deadlock, stuck I/O.
+
+State: same as the crash case at whatever step it stuck — but the process is
+  alive, so the watchdog goroutine is alive too.
+
+Without WatchdogTTL:
+  Watchdog keeps extending the lock every TTL/3, forever. Readers that miss
+  the cache see LOCKED, hit their max wait (2 × LockTTL), and fall back to an
+  uncached DB read — every one of them, for as long as the hang lasts.
+  The "TTL backstop" never kicks in: TTL only expires if nobody extends it.
+
+With WatchdogTTL (M3 cap):
+  Extensions are clipped to the deadline → lock expires exactly WatchdogTTL
+  after the write started.
+  Readers unblock: one leases and reads DB, the rest wait for its fill.
+  Worst lock-held time ≈ WatchdogTTL (readers give up at 2 × LockTTL and read
+  DB uncached before that).
+
+If the stuck writer later unsticks:
+  It no longer holds the lock → "writer paused past its lock TTL" residual
+  (§17). Its write-through is still guarded by M5's version compare; the DB
+  write itself is only guarded by a fence (out of scope here).
+
+Staleness:  None while hung (same states as the crash case).
+```
+
 **Summary: lock stack failure paths**
 
 Reader latency has three cases:
@@ -1938,6 +2133,8 @@ Failure paths
 4. Lua SET fail   empty     new      No       ~1-5ms *       block+1-5ms   block+1-5ms No ‡
 5. DEL lock fail  correct   new      No       ~0.1-0.5ms     ~0.1-0.5ms    ~0.1-0.5ms  Yes (M8)
 6. Writer crash   varies    varies   No       ~0.1-0.5ms *   TTL/2+1-5ms   TTL+1-5ms   Varies
+6b. Writer hangs  varies    varies   No       ~0.1-0.5ms *   uncached DB   uncached DB Yes, after
+                                              (M8 hit)       after 2×TTL   after 2×TTL WatchdogTTL
 7. Lease holder   empty/    same     No       fill *         LeaseTTL/2    LeaseTTL    Yes, after
    crashes        lease                       +fill          +fill         +fill       re-lease
 8. Lease holder   lease→    same     No       fill *         ½fill+S       ~2×fill+S   Yes, after
@@ -1966,6 +2163,11 @@ fill = lease holder's fill window ≈ n_d + s + n_r + l (DB SELECT + leaseSet).
 
    6. Writer crash: block ≈ up to TTL (configurable). Watchdog is dead, lock expires.
      After TTL: cache hit if populated before crash, or DB SELECT if not.
+
+   6b. Writer hangs: watchdog alive, keeps extending up to the deadline. Readers
+     on a miss give up at 2 × LockTTL and read DB uncached. WatchdogTTL after
+     the write started the lock expires and the cache works again (one lease
+     holder fills). Without the WatchdogTTL cap this never ends.
 
    7. Lease holder crashes (after GRANTED, before leaseSet): waiters sit on
      LEASED until LeaseTTL expires, then one gets GRANTED and fills. Bounded by
@@ -2912,6 +3114,18 @@ RT 4: Lua SET cache {new data, version} (or plain SET)
 RT 5: DEL lock
 ```
 
+**Lock stack, writer lease as the lock (M2c — chosen, implemented): 2 Redis round trips**
+
+```
+RT 1: Acquire Lua — slot LW:*? wait. Else SET LW:<id> (lock + invalidate),
+      return the old data (for restoration)
+        ── DB UPDATE happens here ──
+RT 2: Finish Lua — version-compare SET of the new data (write-through = unlock)
+```
+
+The separate GET / DEL / DEL-lock commands disappear: placing the writer lease
+*is* the delete, and the write-through *is* the unlock.
+
 **CAS write path: 2 Redis round trips**
 
 ```
@@ -2955,6 +3169,21 @@ Lock stack pipelined: Pre-DB Lua(SETNX+GET+DEL) → DB UPDATE → Post-DB Lua(SE
 = (n_r+l) + (n_d+u) + (n_r+l)
 = **2n_r + 2l + n_d + u**
 
+Lock stack M2c (chosen): Acquire Lua (LW: = lock + invalidate) → DB UPDATE → Finish Lua (SET = unlock)
+= (n_r+l) + (n_d+u) + (n_r+l)
+= **2n_r + 2l + n_d + u** — the same cost as the pipelined form; it *is* the
+pipelined form with the lock stored in the cache key, so every result below for
+"pipelined" applies to M2c unchanged.
+
+What the rest of the chosen write path adds — nothing on the normal path:
+
+| Extra | Cost | When |
+|---|---|---|
+| Watchdog extend (Lua) | n_r + l per extension | Only if a write outlives LockTTL/3 (~0.67s); a normal ms-long write never pays it |
+| Deadline + MinWriteBudget check | ~0 (in-process clock read) | Every write |
+| Deadlock retry | + (n_d + u) per retry, + 1–6ms backoff | Only when MySQL picks the write as a deadlock victim (≤ 2 retries) |
+| Restore on definite DB failure | n_r + l (release Lua with the saved value) | Failure path only |
+
 **Reader costs — no write vs during write:**
 
 These are separate calculations. "No write" is the steady-state read cost.
@@ -2978,6 +3207,8 @@ During write — modeled as reader arriving at a uniformly random point during
 the blocked period, so average wait = 1/2 of the remaining blocked time:
 
 **Lock stack reader (cache miss, blocked after DEL cache):**
+(With M2c the block starts at the acquire, which is the DEL; the window and the
+formula are the same.)
 - The blocked window starts after DEL cache: DB UPDATE + post-DB Lua = (n_d + u) + (n_r + l)
 - Reader arrives uniformly in this window → average wait: 1/2(n_d + u + n_r + l)
 - The unlock is noticed on the next poll: + S
@@ -3003,7 +3234,10 @@ trip and atomic.)
 **Note — M8 (serve-if-exists) best case for lock stack:** Readers arriving
 between SETNX and DEL cache (cache still has old correct data) or between Lua
 SET cache and DEL lock (cache has new correct data) get a cache hit at n_r + p
-with zero blocking. The average formula above models the blocked case. In
+with zero blocking. With M2c both windows close — acquiring is the delete and
+the write-through is the unlock — so M8 hits come only from readers arriving
+before the acquire or after the finish. Those windows were one Redis round trip
+each (zero in the pipelined form), so the blocked-case formula is unaffected. The average formula above models the blocked case. In
 practice, M8 makes real-world lock stack reader cost lower than the formula.
 
 **Cold miss (no write in progress, nothing cached):**
@@ -3020,12 +3254,21 @@ practice, M8 makes real-world lock stack reader cost lower than the formula.
   doing its own DB read. With N concurrent misses: Simple and CAS do **N** DB
   reads; the lease does **1** (across all instances).
 
+**Fallback paths (chosen design, not in the per-cycle totals below):**
+
+| Path | Cost |
+|---|---|
+| Reader gives up waiting on a writer lease (MaxLockedWait, or only ~LeaseTTL left before its request deadline) | waited time + (n_d + s), result not cached |
+| Lease holder's DB read outlives LeaseTTL | its fill is dropped (correct); a waiter takes a new lease → another n_d + s. Only when the DB is slower than LeaseTTL |
+| Write refused by MinWriteBudget | the acquire (n_r + l) + release (n_r + l); no DB call |
+
 **Total system cost per write cycle (write + R readers during write):**
 
 ```
 Approach         Write cost                + R × (reader during write)
 ───────────────────────────────────────────────────────────────────────────
 Simple           n_r + p + n_d + u         + R(n_r + p)
+Lock M2c (chosen) 2n_r + 2l + n_d + u      + R(3/2 n_r + 3/2 l + 1/2 n_d + 1/2 u + S)
 Lock pipelined   2n_r + 2l + n_d + u       + R(3/2 n_r + 3/2 l + 1/2 n_d + 1/2 u + S)
 Lock naive       5n_r + 4p + l + n_d + u   + R(3/2 n_r + 3/2 l + 1/2 n_d + 1/2 u + S)
 CAS              2n_r + 2p + n_d + u       + R(n_r + p + 3/2 n_d + 1/2 u + s)
@@ -3059,9 +3302,9 @@ Approximating (p, l small relative to n_r and n_d):
 If n_d + s ≤ 1/2 n_r + S, the lock stack reader is *slower* than the CAS
 reader and naive lock never catches up on latency alone.
 
-Pipelined lock vs CAS: write costs differ only by 2l − 2p ≈ 0, so pipelined
-lock wins on latency at **R ≥ 1 whenever the denominator is positive**, and
-loses per reader when it isn't.
+Pipelined lock (and M2c, the chosen form — same cost) vs CAS: write costs
+differ only by 2l − 2p ≈ 0, so pipelined lock wins on latency at **R ≥ 1
+whenever the denominator is positive**, and loses per reader when it isn't.
 
 | Scenario (qualitative) | Denominator n_d + s − ½n_r − S | Naive breakeven | Pipelined |
 |---|---|---|---|
@@ -3248,14 +3491,16 @@ Lock stack write path (conservative, no pre-DB Lua): 3 RTs
 
 **Updated table with pipelining:**
 
-| Network scenario | Redis RTT | Lock stack naive (5 RTs) | Lock stack pipelined (2-3 RTs) | CAS (2 RTs) | Simple (1 RT) |
-|---|---|---|---|---|---|
-| Same datacenter | ~0.1-0.5ms | ~0.5-2.5ms | ~0.2-1.5ms | ~0.2-1ms | ~0.1-0.5ms |
-| Cross-datacenter | ~1-10ms | ~5-50ms | ~2-30ms | ~2-20ms | ~1-10ms |
-| Cross-region | ~10-100ms | ~50-500ms | ~20-300ms | ~20-200ms | ~10-100ms |
+| Network scenario | Redis RTT | Lock stack naive (5 RTs) | Lock stack pipelined (2-3 RTs) | Lock stack M2c — chosen (2 RTs) | CAS (2 RTs) | Simple (1 RT) |
+|---|---|---|---|---|---|---|
+| Same datacenter | ~0.1-0.5ms | ~0.5-2.5ms | ~0.2-1.5ms | ~0.2-1ms | ~0.2-1ms | ~0.1-0.5ms |
+| Cross-datacenter | ~1-10ms | ~5-50ms | ~2-30ms | ~2-20ms | ~2-20ms | ~1-10ms |
+| Cross-region | ~10-100ms | ~50-500ms | ~20-300ms | ~20-200ms | ~20-200ms | ~10-100ms |
 
 With pipelining, the lock stack's network overhead approaches CAS's — both at
-2 RTs. The extra Redis operations (SETNX, GET, DEL vs just INCR) are batched
+2 RTs. M2c is always 2 RTs (no "conservative 3 RT" variant): the lock, the
+delete and the old-value read are one Lua call on one key, and so are the
+write-through and the unlock. The extra Redis operations (SETNX, GET, DEL vs just INCR) are batched
 into the same round trips, so the network cost is amortized. You pay for the
 round trips, not the individual commands.
 
@@ -3598,10 +3843,12 @@ touched this key since my DB read began?" — and that is exactly the question.
 
 **Residual risks (outside this project's scale):**
 
-- **Writer paused past its lock TTL** (stop-the-world GC, VM freeze): the lock
-  expires, another writer runs, then the paused writer wakes and writes. Fix:
-  fence the DB write with a conditional update
-  (`UPDATE … SET …, row_version = ? WHERE id = ? AND row_version = ?`).
+- **Writer paused past its lock TTL** — the **late writer** (§17b): its lock
+  expires, a reader caches the then-current value, then its commit lands with
+  no write-through after it. Shared timeout context + MinWriteBudget + MySQL
+  lock-wait timeouts below it (fix 1) remove the likely path; binlog-driven invalidation
+  is the general fix. A fence (`WHERE row_version = ?`) only guards against
+  another writer and isn't needed for blind writes (§17b "The fence").
 - **Redis failover losing a recent DEL** (async replication): the old value can
   reappear. Out of scope for a single Redis instance.
 
@@ -3682,8 +3929,515 @@ so under memory pressure an eviction policy can evict the lock mid-write and
 let a second writer in. Evicting a lease or data key is harmless. Keep memory
 headroom and alert on evictions.
 
-**10. Redis Cluster: hash tags.** readCheck touches the cache key and the lock
-key; in Cluster both must share a slot: `{user:<id>}` and `{user:<id>}:lock`.
+**10. Redis Cluster: hash tags.** With a separate lock key (M2b form),
+readCheck touches the cache key and the lock key, so in Cluster both must share
+a slot: `{user:<id>}` and `{user:<id>}:lock`. With the chosen M2c form the lock
+lives in the cache key, every script touches that one key, and no tag
+coordination is needed (the braces are kept so keys stay stable).
+
+---
+
+## 17b. Writer Liveness, the Late Writer, Writer Lease in the Slot (M2c), Multi-Key Writes, Heavy Writes
+
+Follow-ups to the lock stack + lease once the watchdog got its `WatchdogTTL`
+cap (§11 M3). None of these change the chosen design's correctness argument;
+they tighten the writer side, name its last residual (the late writer), and
+record the options considered.
+
+### Writer liveness — stopping the writer, not just the lock
+
+`WatchdogTTL` stops the watchdog extending the lock. It does **not** stop the
+writer: a writer stuck on a DB call keeps running, and if the call returns
+after the lock expired, the writer carries on and writes without the lock.
+
+**Shared timeout context (chosen).** Give the write one deadline and hand it to
+both the watchdog and the DB call. The deadline comes from the **request**: the
+TCP server gives every request a timeout (4s — below the HTTP side's 5s, which
+doesn't cross the TCP hop), and the lock stack uses the earlier of that and
+`WatchdogTTL` (4s, the fallback for callers without a deadline):
+
+```
+ctx = WithTimeout(requestCtx, WatchdogTTL)   → deadline = min(request, WatchdogTTL)
+acquire LW:        → lease TTL clipped to the deadline (can't outlive the request)
+watchdog(ctx)      → extensions clipped to the deadline (lock expires then)
+dbWrite(ctx)       → query cancelled at the deadline → transaction rolled back
+```
+
+**Don't start a DB write you can't finish while holding the lock —
+`MinWriteBudget`.** Time is spent before the DB step (session lookup, the
+avatar file write, waiting for another writer's lease). Right before each DB
+attempt the writer checks there is at least `MinWriteBudget` (1.5s) left; if
+not, it returns an error before sending anything (DB untouched → old cache
+value restored). Once sent, MySQL may queue the statement for up to its
+lock-wait timeout (fix 1, 1s), so `MinWriteBudget` > lock-wait guarantees every
+attempt finishes or fails while the lease is still held.
+
+```
+HTTP backendTimeout        5s
+TCP per-request timeout    4s     whole op; the lease can't outlive it
+LOCKSTACK_WATCHDOG_TTL     4s     fallback cap when the caller has no deadline
+LOCKSTACK_MIN_WRITE_BUDGET 1.5s   least time left to START a DB attempt
+MySQL lock-wait timeouts   1s     (fix 1) < MinWriteBudget; 1s is MySQL's minimum
+LOCKSTACK_LOCK_TTL         2s     lease TTL between watchdog refreshes; crash recovery
+```
+
+The TCP server refuses to start unless `lock-wait < MinWriteBudget <
+min(request timeout, WatchdogTTL)`.
+
+**Retries — deadlocks only.** A DB attempt is retried only if MySQL rolled it
+back as a deadlock victim, at most `MaxDeadlockRetries` (2) times, each retry
+gated by `MinWriteBudget` again. Which failures are retried, and why:
+
+| Failure | Retry? | Why |
+|---|---|---|
+| **Deadlock** (MySQL error 1213) | **Yes, once or twice** | MySQL rolled back this statement immediately (detected in milliseconds) to break a cycle — nothing committed. Retrying right away usually works. This is the standard retryable MySQL error |
+| **Lock-wait timeout** (error 1205, the 1s case) | **No** | Something has held that row or table for a full second: a migration or a long transaction. Lock-stack writers to one key never queue in MySQL — the `LW:` lease serializes them — so it's something outside the lock stack. A retry would likely wait out another full second behind the same lock while keeping the cache slot blocked. Not retrying returns the error at ~1s (MySQL's minimum wait) instead of ~3s |
+| **Unknown outcome** (deadline passed, connection lost mid-statement) | **Never** | The first attempt may have committed. Repeating it could apply the write twice. For a nickname that's mostly harmless (same value, `row_version` bumps twice), but it isn't safe as a general rule |
+| **Definite failures** (constraint violation, user not found) | **Never** | It will fail the same way again |
+| **Bad connection before anything was sent** | Already handled | The DB pool already retries these (`MaxBadConnRetries`), because the driver only reports `ErrBadConn` when it's certain nothing was sent |
+
+The budget check stops slow failures from piling up even if they were
+retried — e.g. three 1s lock-wait attempts would hold the slot for 3s and
+then stop with 1s left (< 1.5s budget). Deadlocks fail fast, so the budget
+rarely limits their retries.
+
+**Note — where network faults land.** Lost or dropped packets are mostly
+invisible to the application: TCP retransmits them, so the app just sees a
+slower response. What the app *can* see is the connection itself failing, and
+which category that falls into depends on **whether the statement had already
+been sent**:
+
+| What happens on the network | What the app sees | Category | Action |
+|---|---|---|---|
+| Packets dropped or delayed, connection still alive | Just latency: TCP retransmits | Nothing, unless it's slow enough to hit the **deadline** → context error | Deadline → **unknown outcome** → no retry, leave cache empty |
+| Connection already dead **before** sending (server closed an idle connection, an RST arrived earlier, a stale pooled connection) | `driver.ErrBadConn` — the driver only returns it when it knows **nothing was sent** (it also checks reused connections for liveness before writing) | **Bad connection, nothing sent** | **Safe to retry** — the pool already does (`MaxBadConnRetries`) |
+| Connection breaks **after** the statement was sent (server crash, RST or partition mid-request) | `mysql.ErrInvalidConn` / `io.ErrUnexpectedEOF` | **Unknown outcome** — MySQL may have committed | No retry, leave cache empty (`isUnknownOutcome`) |
+| Silent partition (no RST, the far side just stops answering) | Sending appears to succeed (it lands in the kernel buffer), then reading the reply hangs | Ends at the **deadline** (or TCP keepalive) | **Unknown outcome** |
+
+So "bad connection, nothing sent" covers one narrow case: the connection was
+already broken and the driver noticed before any bytes left. Everything that
+goes wrong after the statement is on the wire is "unknown outcome" — which is
+exactly why the code must not retry those and must not restore the old cache
+value.
+
+The silent-partition row is also why the request-wide deadline matters.
+Without one, a hung read on a partitioned connection only ends when TCP
+keepalive gives up, which can take minutes. With the per-request timeout it
+ends at the deadline, as an unknown outcome, and the lease expires on schedule.
+
+**Rule that comes with it — a context error is an *unknown* outcome.** If the
+deadline fires during COMMIT, the client gets an error but MySQL may have
+committed. The DB-failure path restores the saved (old) cache value, which
+would then be stale. So:
+
+| DB result | Cache action |
+|---|---|
+| Success | Write-through (M9) |
+| Definite failure (constraint, deadlock, rejected) | Restore saved value (ownership-checked) |
+| Context deadline / cancellation / connection lost mid-commit | **Don't restore** — leave the slot empty; the next reader leases and reads the DB, whichever way the commit went |
+
+**Warning — the shared context alone makes things worse, not better.**
+Cancelling the context closes the connection, but it does not reliably stop a
+statement MySQL has already **queued** (e.g. behind a migration's metadata lock
+or a long transaction on the row). Without the shared context the writer just
+waits, and when the statement finally runs it gets success and its
+write-through repairs the cache. With it, the writer has already given up, so a
+late commit has **nobody to repair the cache** (the late writer, below). So the
+shared context is only safe together with fix 1.
+
+**Fix 1 (required) — make MySQL give up before the lock does.** Per session,
+set both lock-wait timeouts below `MinWriteBudget` (and so below the write's
+deadline):
+
+```sql
+SET SESSION lock_wait_timeout = 1, innodb_lock_wait_timeout = 1;  -- MinWriteBudget = 1.5s
+```
+
+The **lock-wait timeout** is how long a statement may wait *inside MySQL* for a
+row lock (`innodb_lock_wait_timeout`) or a table metadata lock
+(`lock_wait_timeout`, e.g. a migration) before MySQL aborts it — not the
+connection pool's queue, and not execution time. Defaults are 1 year (metadata)
+and 50s (row) — both far past the write's deadline; whole seconds, minimum 1.
+With fix 1 a queued UPDATE fails **inside MySQL** before the Redis lock
+expires, so it can't commit late. This is a server-side guarantee,
+not a client-side hope. Make sure it is applied on every pooled connection
+(e.g. in the DSN / connection init), not once.
+
+**Fix 2 (optional safety net) — delayed DEL on an unknown outcome.** When the
+writer gets a context error, schedule a Redis `DEL {user:<id>}` for later than
+MySQL could still run the statement. By then a late commit has happened or
+never will; the DEL removes any old value a reader cached in between, and the
+next reader leases and reads the DB. If nothing committed, it costs one cache
+miss. (It is a cache DEL — it never touches MySQL and never restores an old
+value.) With fix 1 in place this only covers the leftovers: a statement that
+got its lock just in time but executed very slowly, or a connection where the
+session settings didn't apply. Documented, not built.
+
+**Separate-process watchdog that kills the writer (option).** A supervisor
+process that kills the writer process outright a margin *before* the lock
+expires. Stronger than the in-process context for the "alive but not
+cooperating" case — the writer can't ignore a SIGKILL — and the DB rolls back
+the dead connection's open transaction. Same limits as below.
+
+**What no timeout fixes, and why that's general:**
+
+- **A statement already sent.** Cancelling or killing the client doesn't recall
+  an UPDATE/COMMIT sitting in the network or MySQL's queue. This applies to any
+  client-side timeout in any system — not specific to the lock stack. (Fix 1
+  bounds the queue wait inside MySQL; nothing on the client can.)
+- **Two clocks.** The deadline runs on the app server's clock, lock expiry on
+  Redis's. A frozen process (VM freeze, swap storm, SIGSTOP) stops its own
+  timers while Redis keeps counting. No clock synchronisation removes this —
+  it's inherent to any lease/timeout lock across two machines.
+
+**Decision:** shared timeout context + no-restore-on-context-error + fix 1.
+Fix 2 and the supervisor are documented options.
+
+### The late writer — a commit after the lock is gone
+
+The lock stack's last residual. It is **not** a slow-reader problem:
+
+| | Slow reader (§17, fixed by M13) | Late writer |
+|---|---|---|
+| Who is late | The reader — its data was **already old** when it wrote it | The writer — the reader's data was **correct** when cached |
+| Sequence | reader reads N → writer DEL + commits N+1 → reader caches N | writer DEL → lock expires → reader leases, reads N, caches N → writer commits N+1 |
+| What catches it | The lease: the writer's DEL came after the grant → fill dropped | Nothing on the reader side — see below |
+
+```
+1. Writer: lock → DEL cache → (stalls, or its UPDATE sits queued in MySQL)
+2. Lock expires (LockTTL with a frozen watchdog, or WatchdogTTL)
+3. Reader: slot empty, no lock → lease → DB → N → leaseSet → caches N   (correct now)
+4. Writer's commit lands → DB = N+1
+5. The writer does not write-through (it gave up, or died)
+   → cache N, DB N+1 → stale until the next write or CacheTTL
+```
+
+**Why no reader-side check can catch it.** At step 3 the reader's data is the
+latest commit. A version compare (M5), a lease token (M13), or any other check
+made at cache time can only compare against what exists *now* — it cannot see
+a commit that hasn't happened yet. Not M5's or M13's fault: what the lock stack
+actually relies on is that **the "write in progress" marker outlives the
+commit** (while the lock exists, no reader can lease between the writer's DEL
+and its commit). The lock's TTL breaks that when the commit is late. It is the
+same class as Simple's "commit, then the DEL fails / writer crashes" — a commit
+with no invalidation after it.
+
+**Its paths, and how rare.** In one sentence: *a write executing in MySQL after
+its lock expired, with no write-through after it.*
+
+| Path | Needs | How rare |
+|---|---|---|
+| Statement queued in MySQL | An UPDATE queued > WatchdogTTL behind a metadata lock (migration) or long transaction, the writer having given up (shared context), **and** a reader fill during the wait | Per incident, not per accident — **if fix 1 is missing**. With fix 1 the statement fails inside MySQL before the lock expires → gone |
+| Process freeze ¹ | A freeze > LockTTL landing in a microsecond window, **and** a reader fill during it | Practically zero |
+
+¹ **Why the frozen process mostly can't cause it.** A freeze (VM pause, swap
+storm, SIGSTOP) stops the writer, the watchdog *and its timers* — the deadline
+can't interrupt anything while frozen, and since the watchdog is frozen too the
+lock expires after **LockTTL** of freeze (not WatchdogTTL). What saves it is
+what the writer does on resume:
+
+| Freeze point (freeze > LockTTL) | On resume | Result |
+|---|---|---|
+| Before the UPDATE is sent, freeze past the write's deadline | Deadline already passed → `ExecContext` refuses to send | No commit → safe |
+| Before the UPDATE is sent, freeze ending before the deadline | Sends, commits (late, lock gone) | Writer is alive → its write-through repairs → at most a ms-long window |
+| After the UPDATE was sent | MySQL isn't frozen → commits at normal speed, before the lock expires | Readers that lease after expiry read the new value → safe |
+| Right after the deadline check passes, before the packet leaves (µs) | Packet goes out past the deadline; driver reports an unknown outcome → writer skips the write-through; the commit lands anyway | **Lasting stale** — fix 2 (delayed DEL) covers it |
+
+Otherwise a freeze only leaves lasting damage if the write-through *also* fails
+separately after a late commit (crash / Redis error right then).
+
+Damage when it happens: one key stale until its next write or CacheTTL; it
+never spreads to other keys.
+
+**Not unique to the lock stack.** A statement still queued after its client
+timed out (HTTP gateway, driver `readTimeout`, context — almost every request
+has one) hits every design where the *writer* maintains the cache:
+
+- **Simple (DB UPDATE → DEL):** skip the DEL on error → the late commit leaves
+  the old value cached; DEL anyway → the DEL runs before the late commit and a
+  reader refills the old value in between. Same result. This is why "delayed
+  double delete" (a second DEL after a delay) is a standard pattern for Simple —
+  the same idea as fix 2.
+- **CAS handles it.** The INCR (N+1) stays; while the statement is queued,
+  readers see counter ≠ cache, read the DB (N — correct, nothing committed) and
+  don't fill (`row_version` N ≠ counter N+1). When the late commit lands, the
+  row carries `row_version = N+1` written *by that statement*, so the next
+  reader's fill matches and caches it — no repair needed. Two properties do it:
+  a marker that never expires, and a version written by the commit itself. Cost:
+  every read of that key goes to the DB while it's queued, and if the statement
+  never commits the cache stays unused until the next successful write.
+- **Borrowing CAS's trick (considered, not an option):** on an unknown outcome,
+  leave a no-TTL `P:<expected version>` marker; readers fill only once the DB's
+  `row_version` reaches it. Same input problem as the fence: the writer must
+  know the new version up front, and `UpdateNickname` only learns it from the
+  statement's own result — on an empty slot there is nothing to put in the
+  marker. Fix 1 + fix 2 cover the same ground more simply.
+
+**Fixes:**
+- Fix 1 (above) removes the queued path; fix 2 covers the µs freeze window.
+- **Binlog-driven invalidation** (Canal / Debezium reading MySQL's binlog and
+  DELing the cache key after each commit) is the general fix — invalidation
+  comes from the commit itself, so it doesn't depend on the writer surviving.
+  It also covers Simple's failed DEL and the Redis-failover case. A lot of
+  infrastructure for this rarity — out of scope.
+- CAS doesn't have this residual (next subsection) — its marker never expires.
+- The fence doesn't help (two subsections down) — no other writer is involved.
+
+### Expiring vs never-expiring marker — safety vs liveness
+
+Every zero-stale design marks "write in progress" somewhere. Whether that
+marker expires decides which residual you get:
+
+| "Write in progress" marker | Late writer (commits after the marker is gone) | Writer dies mid-write |
+|---|---|---|
+| **Expires** (lock stack's lock TTL) | ✗ the marker can be outlived → stale cache possible | ✓ self-heals after the TTL |
+| **Never expires** (CAS's INCR; a no-TTL lock) | ✓ readers refuse to fill while it stands | ✗ CAS: cache unusable until the next successful write. No-TTL lock: the key is locked **forever** until cleared by hand |
+
+You can't have both from one marker. This is the general safety-vs-liveness
+trade-off of distributed locks:
+
+- **Release only by the holder** → safety (nobody else gets in while the holder
+  lives), but a crashed holder blocks forever.
+- **Auto-release on a timeout** → liveness, but a frozen holder can outlive it.
+
+Every "middle" option is the second one in disguise. A watchdog or supervisor
+that removes a dead writer's lock must first *decide* the writer is dead, which
+over a network means "no heartbeat for X seconds" — a timeout. A frozen or slow
+writer looks exactly like a dead one (no failure detector can tell them apart
+perfectly), so it can be wrong in the same way a TTL is. Watchdog vs TTL vs
+supervisor only picks where the timeout lives and how long it is.
+
+The way out is not a better lock but making a late holder **harmless** at the
+resource: a fence (rejects a late writer vs another writer) or binlog-driven
+invalidation (the commit itself invalidates). The lock stack takes the TTL side
+and accepts the late writer; CAS takes the never-expire side and accepts an
+unusable cache after a failed write.
+
+A no-TTL lock doesn't even buy the guarantee: crashes mid-write (deploys, OOM,
+panics) are common and each one locks a key until someone clears it, and a
+Redis failover can lose the lock key anyway — letting a second writer in.
+
+### The fence — not needed for blind writes
+
+A fence is a condition in the UPDATE itself, checked by MySQL atomically when
+the statement runs — not an extra "check back before commit" round trip:
+
+```sql
+UPDATE users SET ..., row_version = row_version + 1
+WHERE id = ? AND row_version = ?      -- value captured at lock acquisition
+```
+
+A late statement still executes but matches 0 rows. It is the one
+clock-independent guard against a late writer — but only against a late writer
+**vs another writer**. And it has an input problem: the value must be captured
+**atomically with acquiring the lock**, and if the cache slot was empty at
+acquire there is no version to capture.
+
+| Way to get the fence value | Cost | Real fence? |
+|---|---|---|
+| (a) Per-key Redis counter `{user:<id>}:fence` (no TTL), `INCR`ed in the acquire Lua; DB column `lock_fence`, `WHERE lock_fence < ?` | 0 extra RT; one more key + schema column. If Redis loses the counter, new values are smaller than the DB's → every write rejected (fail-closed) → re-seed from the DB on rejection | Yes |
+| (b) Cached version if present, else `SELECT row_version` | +1 DB RT on uncached writes | No on that path — a stall between acquire and SELECT slips through |
+| (c) No fence | — | — |
+
+**Resolution: (c) for this workload.** What a late writer could break:
+- **DB order** — nickname/avatar updates are *blind writes* (set a value, don't
+  depend on anything read under the lock). A late writer landing after another
+  is just "two overlapping requests, last commit wins" — a legal order; there
+  is no lost update to prevent. The DB is the source of truth, so whatever
+  commits *is* the truth.
+- **The cache** — that's the late writer above, and the fence doesn't cover it
+  (it only rejects when *another writer* wrote meanwhile).
+
+One DB-side surprise exists but is general, not the lock stack's: write A
+times out, the user retries with B, B commits, then A's queued statement
+commits — the DB ends with A. That happens with plain DB writes behind any
+timeout; fixing it needs a fence or idempotency keys on every write.
+
+Use (a) only if a **read-modify-write** update (counters, balances, append)
+ever goes through the lock stack — there a late writer acting on stale input
+does real damage.
+
+### Writer lease in the slot (M2c) — merging the lock into the cache key (implemented)
+
+Instead of a separate `{user:<id>}:lock` key, the writer puts its own lease
+into the same slot that holds data and reader leases:
+
+| Slot value | Meaning |
+|---|---|
+| `<v>\n<data>` | real data (starts with a digit) |
+| `LR:<token>` | reader lease (M13) |
+| `LW:<writer_id>` | writer lease = the lock |
+| empty | nothing cached |
+
+```
+Acquire (1 Lua):  slot is LW:* → HELD (wait)
+                  else → save old value if data; SET LW:<id> PX LockTTL; return old
+                         (overwriting LR: voids the reader's lease, like today's DEL)
+DB UPDATE         watchdog: PEXPIRE only while slot == LW:<id>
+Finish (1 Lua):   success → version-compare SET data (this is also the unlock)
+                  DB failure → slot == LW:<id>? restore saved value, or DEL
+Reader:           data → HIT, LW: → LOCKED, LR: → LEASED, empty → grant LR:
+```
+
+A separate `LW:` prefix (rather than reusing the reader's `L:`) is what stops a
+**reader from blocking a writer**: the writer overwrites any `LR:`, and waits
+only on another `LW:`.
+
+**Gains:**
+- 5 writer steps → 2 Lua calls (same round trips as the pipelined variant, but
+  simpler scripts).
+- Two failure modes vanish: "DEL cache fails after locking" (locking *is* the
+  invalidation) and "DEL lock fails after write-through" (the SET *is* the
+  unlock).
+- Every script touches one key — no hash tags / CROSSSLOT concerns in Cluster.
+- The state is visible in one `GET`.
+
+**Rule it requires — the finish step must not require ownership.** If the
+writer's lock expired and a reader was granted `LR:` *before* the writer's
+commit, that reader's DB read is old. The finish step must overwrite that
+`LR:` (voiding it), exactly as today's `versionSet` does:
+
+```
+slot = LW:<mine> or LR:* or empty → version-compare SET
+slot = LW:<other>                 → skip (that writer finishes the job)
+```
+
+Requiring `slot == LW:<mine>` would let the stale reader's `leaseSet` succeed —
+reopening the gap M13 closed.
+
+**Losses:**
+- The serve-if-exists (M8) window between acquire and DEL disappears — it was
+  one round trip (zero in the pipelined variant), so nothing in practice.
+- A slot can only lock itself. Writes spanning several cache keys need ordered
+  acquisition (next subsection).
+- Refactor cost: scripts, lease-prefix decoding, tests, docs.
+
+The C++ analogy holds: like packing a lock bit or ABA counter into the same
+word as a pointer so one atomic op changes both, the lock and the state live in
+one value and can't drift apart. It is still a lock — readers wait on `LW:` —
+just colocated with the data. (Redis already makes any Lua on one key atomic;
+the gain is fewer independent pieces, not atomicity itself.)
+
+**Status: implemented** — `internal/lockstack` stores its lock this way (there
+is no `{user:<id>}:lock` key). Catalogued as **M2c** (§11) with its own row in
+§12 — a variant of the lock (where it lives), not a new problem-fixing
+mechanism: **the chosen design is the lock stack + lease with its lock stored as
+a writer lease (M2c)**; the separate-lock-key form (M2b) is superseded. Same P1–P8 results and same residuals (the late writer applies
+unchanged: `LW:` expires like the lock key). Revisit if multi-key writes appear
+(next subsection).
+
+### Multi-key writes — ordered acquisition
+
+With the lock in each slot (M2c), a write that changes keys A, B and C together
+acquires their writer leases **in one fixed global order** (A → B → C):
+
+```
+deadline = now + WatchdogTTL            (from the first acquire)
+acquire LW on A → B → C                 (wait on each; abort if deadline passes)
+DB UPDATE (one transaction)
+finish C, B, A  (or all at once)        (each finish writes data = unlock)
+on abort/failure: restore each acquired slot's saved value, release
+```
+
+- **No deadlock:** everyone takes leases in the same order, so no cycle of
+  waiters can form (classic lock ordering).
+- **Finer granularity than one big lock:** while the writer holds A and waits
+  for B, C is still untouched — readers of C get hits (its old value is still
+  the truth, nothing has committed). Readers block only on slots already taken.
+- **One deadline for the whole operation:** if B or C can't be taken in time,
+  abort and restore A — the DB never changed.
+
+Conditions it relies on:
+- **Every writer of B or C follows the same order.** "A as the lock for the
+  group" only works if B and C are written *only* by this use case; otherwise
+  each needs its own lease, taken in order.
+- **Cross-key visibility is per key.** Between finishing A and finishing C, a
+  reader of both can see new A with old C. Finishing all in one Lua needs them
+  in one Redis Cluster slot (shared hash tag); otherwise accept per-key
+  consistency.
+- **The DB side must be atomic too.** One transaction — which fails if the rows
+  live on different DB shards (this project shards users), so cross-shard
+  writes need their own scheme.
+
+### Heavy writes and reader starvation
+
+Under back-to-back writes to one key, the cache can't help — every write
+invalidates it, in any design. A zero-stale read overlapping a write must
+either wait or come from the source of truth.
+
+But readers are **not starved**: after their LOCKED max wait they read the DB
+directly. Under MVCC a plain SELECT returns the last committed value
+immediately — correct, just uncached (no lease → no populate). The cost moves
+to DB load for that key, not to unbounded reader waits.
+
+- **The max wait is the lever.** It is currently `2 × LockTTL` (4s at the
+  defaults) — far longer than a write takes. A short cap (a few × p99 write
+  time) makes the fallback kick in quickly. The value can be tuned later; the
+  mechanism already exists.
+- **Readers already have an edge between writes.** Readers poll every
+  0.5–4ms; waiting writers retry every `LockTTL / MaxLockRetries` (10ms at the
+  defaults), so after one writer's write-through readers usually catch the data
+  before the next writer acquires.
+- **Coalescing waiting writers (option).** Nickname/avatar are
+  last-writer-wins: if B and C queue behind A, only C's value matters. Merging
+  them means fewer write windows. Only worth it for a genuinely hammered key.
+- **Serve the old value during a write (rejected).** The writer lease could
+  carry the old data (`LW:<id>\n<old>`). Fine while the write is in flight, but
+  between DB commit and the final SET the cache is behind the DB — and a reader
+  that fell back to the DB (new) followed by one served from cache (old) sees
+  time go backwards. Breaks the strict zero-stale guarantee.
+
+---
+
+## 17c. Guarantee and Failure Model
+
+No design prevents every fault — that's true of any distributed system, not
+just this one. The faults fall into three kinds, and only one is truly beyond
+reach:
+
+| Kind of fault | Examples | Preventable? |
+|---|---|---|
+| **Implementation rules** | SET only on a confirmed 1-row update; never SET on an unknown outcome; fallback / lease reads go to the primary; one MGET; don't restore on a context error | **Yes, fully** — code correctness, enforced by tests |
+| **A store losing acknowledged writes** | Redis or MySQL failover with async replication; restart without fsync | **Yes, at the store, not in the cache design** — semi-sync replication (MySQL), `WAIT` / `appendfsync always` (Redis). Costs latency on every write, so most systems accept a small loss window |
+| **Timing between machines** | A write executing after its lock expired; a frozen process; a statement already sent; two clocks | **Not by any lock or timeout design** — only by driving invalidation from the DB's own commit (binlog) or not caching |
+
+So "zero stale" is stated the way mature systems state guarantees: **under a
+failure model** — which failures are covered, and which are accepted with a
+bound on the damage.
+
+### Lock stack + lease (chosen)
+
+**No stale reads under:**
+- writer or reader crashes (lock TTL + watchdog, lease TTL, delete-first)
+- Redis errors and timeouts (cache left empty or restored; degrade to Simple
+  if Redis is down)
+- DB errors and timeouts (definite failure → restore; unknown outcome → leave
+  empty)
+- concurrent writers (lock) and slow readers (lease)
+- a Redis restart (cache empties, readers lease and refill correctly)
+- writers hung on DB calls (request deadline / `WatchdogTTL` + shared timeout
+  context + `MinWriteBudget` + MySQL lock-wait timeouts below it — §17b fix 1)
+
+**Accepted — one key, bounded by its next write or CacheTTL:**
+- Redis or MySQL losing acknowledged writes on failover
+- a write executing in MySQL after its lock expired with no write-through after
+  it (the late writer, §17b) — its main path is removed by fix 1; what's left
+  needs a freeze landing in a microsecond window
+
+**To close the accepted cases, if ever required:** semi-sync replication for
+MySQL, `WAIT` / AOF for Redis, and binlog-driven invalidation for the rest.
+
+### CAS, for comparison
+
+Almost the same statement. It moves the late writer from "accepted" to
+"covered" (marker never expires + version written by the commit, §17b), and
+adds: after a Redis restart or counter eviction, writes are rejected until the
+counter catches up (fail-closed, not stale); after a failed write, the cache is
+unusable until the next successful write.
+
+The goal is therefore not "zero stale, full stop" — nothing can promise that —
+but **"zero stale under this failure model, with these residuals bounded to one
+key for at most CacheTTL"**: a claim that holds up in a design review.
 
 ---
 
@@ -3712,7 +4466,7 @@ The complexity of the other approaches is not free — more moving parts means
 more failure modes, harder debugging, and operational overhead that must be
 justified by the staleness requirement.
 
-**2. Lock stack + lease, pipelined (M2b+M3+M7+M8+M9+M10+M13, with Lua batching).**
+**2. Lock stack + lease, pipelined — chosen: as M2c (writer lease as the lock), M2c+M3+M8+M9+M10+M13.**
 
 (M5 is kept only on the writer's SET; readers populate through the M13 lease —
 see §17 Option E. Versus lock stack (M5): write cost unchanged and no extra read
@@ -3728,6 +4482,13 @@ the post-write cache, and fresh data.
 The pipelining reduces 5 Redis RTs to 2 by batching:
 - Pre-DB: Lua script (SETNX + GET + DEL) → 1 RT
 - Post-DB: Lua script (version-compare SET + DEL lock) → 1 RT
+
+M2c (§17b) is this pipelined form taken one step further and is what's
+implemented: the lock *is* a writer lease in the cache key, so the pre-DB
+script is "SET `LW:<id>` unless another `LW:` is there" (lock + invalidate +
+return old data) and the post-DB script is the version-compare SET (which
+replaces `LW:`, i.e. unlocks). Same 2 RTs, one key, and the "DEL cache fails" /
+"DEL lock fails" failure modes disappear.
 
 This makes the write path network cost match CAS while retaining all the lock
 stack's reader-side benefits. The implementation complexity is higher (Lua
@@ -3946,9 +4707,13 @@ in addition to P2, without needing any lock.
 - No lock overhead, no complexity
 - Best for: most systems, especially high-read-low-write
 
-### Lock stack + lease (M2b+M3+M7+M8+M9+M10+M13) — chosen for zero stale
+### Lock stack + lease (M2c+M3+M8+M9+M10+M13) — chosen for zero stale
 
-(M5 version compare kept on the writer's write-through only.)
+The lock is a writer lease `LW:<writer_id>` in the cache key itself (M2c):
+acquiring it is the delete-first invalidation, and the version-compare
+write-through (M5, writer only) is the unlock. One deadline shared by the
+watchdog and the DB write (the request timeout), `MinWriteBudget` before each DB
+attempt, MySQL lock-wait timeouts below it, deadlock-only retries (§17b, §17c).
 
 - Zero stale reads — M13 closes the last gap (slow reader refilling the empty
   slot after a failed writer, §17 Option E)
@@ -4028,8 +4793,10 @@ user:123:lock     → hash("user:123:lock") → some other slot, maybe another n
 nodes. A Lua script, `MGET` or `MULTI` that touches several keys only works if
 all of them are in **one slot** — otherwise Redis rejects it with `CROSSSLOT`,
 because one node can't atomically operate on keys held by another. So:
-- Lock stack + lease: readCheck touches the cache key and the lock key →
-  `{user:<id>}` and `{user:<id>}:lock`
+- Lock stack + lease, chosen M2c form: the lock is a writer lease in the cache
+  key, so every script touches one key → no tag needed (braces kept for stable
+  keys). The separate-lock-key form (M2b) touched both → `{user:<id>}` and
+  `{user:<id>}:lock`
 - CAS: the `MGET` reads the counter and the cache entry →
   `{user:<id>}:version` and `{user:<id>}`
 - Simple (M1+M10+M4): each operation touches one key → no tag needed;
@@ -4054,4 +4821,5 @@ because one node can't atomically operate on keys held by another. So:
   lands. The longer case is the DEL itself failing (Redis error or writer crash
   between DB commit and DEL): the old key can then be served until its CacheTTL
   expires, or until readers move to the new version key (version-in-key, M4).
-- If zero stale is required, the chosen design is the lock stack + lease: M2b+M3+M7+M8+M9+M10+M13 (M5 kept on the writer's write-through only). See §17 Option E.
+- If zero stale is required, the chosen design is the lock stack + lease with the lock stored as a writer lease in the cache key: M2c+M3+M8+M9+M10+M13 (M5 kept on the writer's write-through only). See §17 Option E and §17b.
+- **What the codebase implements:** the lock stack + lease in that M2c form (`internal/lockstack`) — the zero-stale design was built, not Simple. The ROI points above are why Simple would also have been acceptable at this scale.

@@ -4,6 +4,7 @@ package config
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -32,9 +33,21 @@ type HTTPConfig struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 	IdleTimeout       time.Duration
+	// BackendTimeout bounds each call from the HTTP server to the TCP server
+	// (default 5s). Must exceed TCP.RequestTimeout and stay below WriteTimeout.
+	BackendTimeout time.Duration
+	// ShutdownTimeout bounds graceful shutdown (default 5s).
+	ShutdownTimeout time.Duration
+	// TCPReconnectBackoff is the wait before redialling a dead TCP connection
+	// (default 1s).
+	TCPReconnectBackoff time.Duration
 }
 type TCPConfig struct {
 	Addr string
+	// RequestTimeout bounds every request the TCP server handles, end to end
+	// (default 4s). Must stay below HTTP.BackendTimeout, so an operation
+	// finishes or fails before the client gives up on it.
+	RequestTimeout time.Duration
 }
 type MySQLPoolConfig struct {
 	MaxOpen           int
@@ -43,6 +56,13 @@ type MySQLPoolConfig struct {
 	MaxIdleTime       time.Duration
 	SweepInterval     time.Duration
 	MaxBadConnRetries int
+	// LockWaitTimeout is set as the MySQL session's lock_wait_timeout and
+	// innodb_lock_wait_timeout on every connection (default 1s, the minimum
+	// MySQL accepts; whole seconds). Must stay below
+	// LOCKSTACK_MIN_WRITE_BUDGET_MS: a statement queued behind a lock then
+	// fails inside MySQL before the lock stack's lock expires, instead of
+	// committing late with nobody left to repair the cache.
+	LockWaitTimeout time.Duration
 }
 type ShardConfig struct {
 	DataShardDSNs   []string
@@ -99,12 +119,17 @@ type SessionConfig struct {
 	TTL time.Duration
 }
 type LockStackConfig struct {
-	LockTTL        time.Duration // default 2s; 0 means use lockstack's built-in default
-	LeaseTTL       time.Duration // default 500ms; 0 means use lockstack's built-in default
-	CacheTTL       time.Duration // default 1h; 0 means use lockstack's built-in default
-	PollMin        time.Duration // default 500µs
-	PollMax        time.Duration // default 4ms
-	MaxLockRetries int           // default 200
+	LockTTL            time.Duration // default 2s; 0 means use lockstack's built-in default
+	WatchdogTTL        time.Duration // default 4s; most a write can hold the lock (if the request deadline isn't earlier)
+	MinWriteBudget     time.Duration // default 1.5s; least time left to start a DB write (> MySQL lock-wait timeout)
+	MaxDeadlockRetries int           // default 2; retries of a DB write MySQL rolled back as a deadlock victim
+	MaxLockedWait      time.Duration // default 2 × LockTTL; how long a reader waits on a writer lease before reading DB uncached
+	CleanupTimeout     time.Duration // default 2s; bound on post-write Redis cleanup (finish, release, lease release)
+	LeaseTTL           time.Duration // default 500ms; 0 means use lockstack's built-in default
+	CacheTTL           time.Duration // default 1h; 0 means use lockstack's built-in default
+	PollMin            time.Duration // default 500µs
+	PollMax            time.Duration // default 4ms
+	MaxLockRetries     int           // default 200
 }
 
 func Load() *Config {
@@ -119,9 +144,15 @@ func Load() *Config {
 			ReadTimeout:       time.Duration(envInt("HTTP_READ_TIMEOUT_SECONDS", 0)) * time.Second,
 			WriteTimeout:      time.Duration(envInt("HTTP_WRITE_TIMEOUT_SECONDS", 0)) * time.Second,
 			IdleTimeout:       time.Duration(envInt("HTTP_IDLE_TIMEOUT_SECONDS", 0)) * time.Second,
+			// Defaults set here (not in the package) so both servers see the
+			// same values when checking how the timeouts nest.
+			BackendTimeout:      time.Duration(envInt("HTTP_BACKEND_TIMEOUT_MS", 5000)) * time.Millisecond,
+			ShutdownTimeout:     time.Duration(envInt("HTTP_SHUTDOWN_TIMEOUT_MS", 5000)) * time.Millisecond,
+			TCPReconnectBackoff: time.Duration(envInt("HTTP_TCP_RECONNECT_BACKOFF_MS", 1000)) * time.Millisecond,
 		},
 		TCP: TCPConfig{
-			Addr: envStr("TCP_LISTEN", ""),
+			Addr:           envStr("TCP_LISTEN", ""),
+			RequestTimeout: time.Duration(envInt("TCP_REQUEST_TIMEOUT_MS", 4000)) * time.Millisecond,
 		},
 		MySQLDataPool: MySQLPoolConfig{
 			MaxOpen:           envInt("MYSQL_DATA_MAX_OPEN", 0),
@@ -129,14 +160,16 @@ func Load() *Config {
 			ConnMaxLifetime:   time.Duration(envInt("MYSQL_DATA_CONN_MAX_LIFETIME_SECONDS", 0)) * time.Second,
 			MaxIdleTime:       time.Duration(envInt("MYSQL_DATA_MAX_IDLE_TIME_SECONDS", 0)) * time.Second,
 			SweepInterval:     time.Duration(envInt("MYSQL_DATA_SWEEP_INTERVAL_SECONDS", 0)) * time.Second,
-			MaxBadConnRetries: envInt("MYSQL_DATA_MAX_BAD_CONN_RETRIES", 0)},
+			MaxBadConnRetries: envInt("MYSQL_DATA_MAX_BAD_CONN_RETRIES", 0),
+			LockWaitTimeout:   time.Duration(envInt("MYSQL_DATA_LOCK_WAIT_TIMEOUT_SECONDS", 0)) * time.Second},
 		MySQLLookupPool: MySQLPoolConfig{
 			MaxOpen:           envInt("MYSQL_LOOKUP_MAX_OPEN", 0),
 			MaxWait:           time.Duration(envInt("MYSQL_LOOKUP_MAX_WAIT_MS", 0)) * time.Millisecond,
 			ConnMaxLifetime:   time.Duration(envInt("MYSQL_LOOKUP_CONN_MAX_LIFETIME_SECONDS", 0)) * time.Second,
 			MaxIdleTime:       time.Duration(envInt("MYSQL_LOOKUP_MAX_IDLE_TIME_SECONDS", 0)) * time.Second,
 			SweepInterval:     time.Duration(envInt("MYSQL_LOOKUP_SWEEP_INTERVAL_SECONDS", 0)) * time.Second,
-			MaxBadConnRetries: envInt("MYSQL_LOOKUP_MAX_BAD_CONN_RETRIES", 0)},
+			MaxBadConnRetries: envInt("MYSQL_LOOKUP_MAX_BAD_CONN_RETRIES", 0),
+			LockWaitTimeout:   time.Duration(envInt("MYSQL_LOOKUP_LOCK_WAIT_TIMEOUT_SECONDS", 0)) * time.Second},
 		Shard: ShardConfig{
 			DataShardDSNs:   envCSV("DATA_SHARD_DSNS", nil),
 			LookupShardDSNs: envCSV("LOOKUP_SHARD_DSNS", nil),
@@ -171,12 +204,17 @@ func Load() *Config {
 			TTL: time.Duration(envInt("SESSION_TTL_SECONDS", 0)) * time.Second,
 		},
 		LockStack: LockStackConfig{
-			LockTTL:        time.Duration(envInt("LOCKSTACK_LOCK_TTL_MS", 0)) * time.Millisecond,
-			LeaseTTL:       time.Duration(envInt("LOCKSTACK_LEASE_TTL_MS", 0)) * time.Millisecond,
-			CacheTTL:       time.Duration(envInt("LOCKSTACK_CACHE_TTL_SECONDS", 0)) * time.Second,
-			PollMin:        time.Duration(envInt("LOCKSTACK_POLL_MIN_US", 0)) * time.Microsecond,
-			PollMax:        time.Duration(envInt("LOCKSTACK_POLL_MAX_US", 0)) * time.Microsecond,
-			MaxLockRetries: envInt("LOCKSTACK_MAX_LOCK_RETRIES", 0),
+			LockTTL:            time.Duration(envInt("LOCKSTACK_LOCK_TTL_MS", 0)) * time.Millisecond,
+			WatchdogTTL:        time.Duration(envInt("LOCKSTACK_WATCHDOG_TTL_MS", 0)) * time.Millisecond,
+			MinWriteBudget:     time.Duration(envInt("LOCKSTACK_MIN_WRITE_BUDGET_MS", 0)) * time.Millisecond,
+			MaxDeadlockRetries: envInt("LOCKSTACK_MAX_DEADLOCK_RETRIES", 0),
+			MaxLockedWait:      time.Duration(envInt("LOCKSTACK_MAX_LOCKED_WAIT_MS", 0)) * time.Millisecond,
+			CleanupTimeout:     time.Duration(envInt("LOCKSTACK_CLEANUP_TIMEOUT_MS", 0)) * time.Millisecond,
+			LeaseTTL:           time.Duration(envInt("LOCKSTACK_LEASE_TTL_MS", 0)) * time.Millisecond,
+			CacheTTL:           time.Duration(envInt("LOCKSTACK_CACHE_TTL_SECONDS", 0)) * time.Second,
+			PollMin:            time.Duration(envInt("LOCKSTACK_POLL_MIN_US", 0)) * time.Microsecond,
+			PollMax:            time.Duration(envInt("LOCKSTACK_POLL_MAX_US", 0)) * time.Microsecond,
+			MaxLockRetries:     envInt("LOCKSTACK_MAX_LOCK_RETRIES", 0),
 		},
 	}
 }
@@ -244,4 +282,22 @@ func envCSV(envKey string, fallback []string) []string {
 		return fallback
 	}
 	return out
+}
+
+// CheckRequestTimeouts reports a request-timeout chain that doesn't nest:
+//
+//	HTTP write timeout > HTTP backend timeout > TCP request timeout
+//
+// The TCP server must give up before the HTTP server stops waiting for it, or
+// a request that "timed out" for the client can still complete afterwards;
+// and the HTTP server needs time left to write the response. A write timeout
+// of 0 means none. Both servers call this, since both load the same config.
+func (c *Config) CheckRequestTimeouts() error {
+	if c.HTTP.WriteTimeout > 0 && c.HTTP.WriteTimeout <= c.HTTP.BackendTimeout {
+		return fmt.Errorf("HTTP_WRITE_TIMEOUT_SECONDS (%v) must exceed HTTP_BACKEND_TIMEOUT_MS (%v)", c.HTTP.WriteTimeout, c.HTTP.BackendTimeout)
+	}
+	if c.HTTP.BackendTimeout <= c.TCP.RequestTimeout {
+		return fmt.Errorf("HTTP_BACKEND_TIMEOUT_MS (%v) must exceed TCP_REQUEST_TIMEOUT_MS (%v)", c.HTTP.BackendTimeout, c.TCP.RequestTimeout)
+	}
+	return nil
 }

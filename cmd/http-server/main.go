@@ -23,6 +23,9 @@ func main() {
 	// TODO: implement
 
 	cfg := config.Load()
+	if err := cfg.CheckRequestTimeouts(); err != nil {
+		log.Fatalf("http-server: %v", err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 

@@ -52,6 +52,7 @@ import (
 
 	"entry_profile_creation/internal/crypto"
 	"entry_profile_creation/internal/db"
+	"entry_profile_creation/internal/lockstack"
 	"entry_profile_creation/internal/model"
 	"entry_profile_creation/internal/protocol"
 	"entry_profile_creation/internal/validate"
@@ -108,13 +109,15 @@ func (s *Server) handleUpdateNickname(ctx context.Context, d *protocol.UpdateNic
 		if err != nil {
 			return nil, 0, err
 		}
+		// The UPDATE has committed: a failure from here on must not make the
+		// lock stack restore the old cached value.
 		user, err := db.GetUserByID(ctx, dataPool, session.UserID)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, lockstack.Committed(err)
 		}
 		data, err := json.Marshal(user.CachedUser())
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, lockstack.Committed(err)
 		}
 		return data, int64(newRV), nil
 	})
@@ -193,13 +196,15 @@ func (s *Server) handleUpdateAvatar(ctx context.Context, d *protocol.UpdateAvata
 		if err != nil {
 			return nil, 0, err
 		}
+		// The UPDATE has committed: a failure from here on must not make the
+		// lock stack restore the old cached value.
 		user, err := db.GetUserByID(ctx, dataPool, session.UserID)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, lockstack.Committed(err)
 		}
 		data, err := json.Marshal(user.CachedUser())
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, lockstack.Committed(err)
 		}
 		return data, int64(newRV), nil
 	})

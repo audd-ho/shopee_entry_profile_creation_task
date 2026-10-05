@@ -1,29 +1,30 @@
 // TODO: Auth-related HTTP handlers.
 //
 // Handlers:
+//
 //   - Signup(w, r)
-//       Parse {username, password, nickname} from JSON body
-//       Validate via internal/validate
-//       Forward to TCP server op=OpSignup
-//       Return 201 on success, 4xx on validation/duplicate
+//     Parse {username, password, nickname} from JSON body
+//     Validate via internal/validate
+//     Forward to TCP server op=OpSignup
+//     Return 201 on success, 4xx on validation/duplicate
 //
 //   - Login(w, r)
-//       Parse {username, password} from JSON body
-//       Forward to TCP server op=OpLogin
-//       On success: set session cookie, return 200 with user info
-//       On failure: return 401 (uniform message, don't reveal user existence)
+//     Parse {username, password} from JSON body
+//     Forward to TCP server op=OpLogin
+//     On success: set session cookie, return 200 with user info
+//     On failure: return 401 (uniform message, don't reveal user existence)
 //
 //   - Logout(w, r)
-//       Read session token from cookie
-//       Forward to TCP server op=OpLogout (invalidates session in Redis)
-//       Clear cookie, return 204
+//     Read session token from cookie
+//     Forward to TCP server op=OpLogout (invalidates session in Redis)
+//     Clear cookie, return 204
 //
 //   - Me(w, r)
-//       Auth already checked by middleware; user_id + username in context
-//       Forward to TCP server op=OpGetMe with user_id
-//       Return 200 with {username, nickname, avatar_url}
-//       avatar_url is derived: /uploads/<id>>>14/<id>/<id>_v<n>_<suffix>.jpg,
-//       or /default.png if avatar_version=0
+//     Auth already checked by middleware; user_id + username in context
+//     Forward to TCP server op=OpGetMe with user_id
+//     Return 200 with {username, nickname, avatar_url}
+//     avatar_url is derived: /uploads/<id>>>14/<id>/<id>_v<n>_<suffix>.jpg,
+//     or /default.png if avatar_version=0
 package httpserver
 
 import (
@@ -39,11 +40,12 @@ import (
 	"entry_profile_creation/internal/validate"
 )
 
-const (
-	// backendTimeout bounds a single call to the TCP server. Login is the slow
-	// one at roughly one bcrypt (~75ms), so this is generous on purpose.
-	backendTimeout = 5 * time.Second
+// backendTimeout bounds a single call to the TCP server (HTTP_BACKEND_TIMEOUT_MS,
+// default 5s). Login is the slow one at roughly one bcrypt (~75ms), so this is
+// generous on purpose. It must exceed the TCP server's own per-request timeout.
+func (s *Server) backendTimeout() time.Duration { return s.cfg.HTTP.BackendTimeout }
 
+const (
 	// maxJSONBody caps auth request bodies. Avatar uploads do not come through
 	// here; they are multipart and get their own, larger limit.
 	maxJSONBody = 64 << 10
@@ -151,7 +153,7 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.backendTimeout())
 	defer cancel()
 
 	var result protocol.SignupResult
@@ -189,7 +191,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.backendTimeout())
 	defer cancel()
 
 	var result protocol.LoginResult
@@ -218,7 +220,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// fails, the browser must stop presenting a token the user asked to drop.
 	ClearSessionCookie(w)
 
-	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.backendTimeout())
 	defer cancel()
 
 	var result protocol.LogoutResult
@@ -233,7 +235,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 // handleGetUser returns the current user's profile. GET /api/user
 func (s *Server) handleGetUser(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.backendTimeout())
 	defer cancel()
 
 	var result protocol.GetUserResult

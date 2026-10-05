@@ -19,7 +19,6 @@ import (
 	"entry_profile_creation/internal/config"
 	"log"
 	"net/http"
-	"time"
 )
 
 type Server struct {
@@ -29,7 +28,7 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config) (*Server, error) {
-	tcpClientPool := NewTCPConnectionPool(cfg.TCP.Addr, cfg.HTTP.TCPPoolSize)
+	tcpClientPool := NewTCPConnectionPool(cfg.TCP.Addr, cfg.HTTP.TCPPoolSize, cfg.HTTP.TCPReconnectBackoff)
 	// no error since if got then logs? not too sure?
 	s := &Server{cfg: cfg, tcpClientPool: tcpClientPool}
 	s.http = &http.Server{
@@ -57,7 +56,7 @@ func (s *Server) Run(ctx context.Context) error {
 	case err := <-errCh:
 		return err
 	case <-ctx.Done():
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutCtx, cancel := context.WithTimeout(context.Background(), s.cfg.HTTP.ShutdownTimeout)
 		defer cancel()
 		_ = s.http.Shutdown(shutCtx)
 		_ = s.tcpClientPool.Close()

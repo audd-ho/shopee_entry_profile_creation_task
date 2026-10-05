@@ -5,13 +5,12 @@ import (
 	"encoding/json"
 	"entry_profile_creation/internal/protocol"
 	"net/http"
-	"time"
 )
 
 // curl "localhost:8080/api/ping?id=123"
 func (s *Server) handleGETPing(w http.ResponseWriter, r *http.Request) {
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), s.backendTimeout())
 	defer cancel()
 
 	var pingResp protocol.PingResp
@@ -27,7 +26,7 @@ func (s *Server) handleGETPing(w http.ResponseWriter, r *http.Request) {
 // curl -X POST localhost:8080/api/ping -d '{"post_test":"456"}'
 func (s *Server) handlePOSTPing(w http.ResponseWriter, r *http.Request) {
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), s.backendTimeout())
 	defer cancel()
 
 	type pingBody struct {

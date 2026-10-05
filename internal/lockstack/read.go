@@ -12,13 +12,14 @@ import (
 // Read executes the lock-stack read path:
 //
 //  1. GET cache — serve immediately on hit (M8: serve-if-exists)
-//     A lease value (L:<token>) is treated as a miss.
-//  2. Cache miss — readCheckScript (atomic cache + lock + lease check):
+//     A lease value (LW:/LR:) is treated as a miss.
+//  2. Cache miss — readCheckScript (atomic slot check + lease grant):
 //     a. HIT: cache populated while we waited → serve it
-//     b. LOCKED: writer in progress → poll with capped exponential backoff
+//     b. LOCKED: writer lease in the slot → poll with capped exponential backoff
 //     c. LEASED: another reader holds the lease → poll
 //     d. GRANTED: we hold the lease → fresh DB read → leaseSet
-//  3. On max wait exceeded: DB read, return without caching
+//  3. On max wait exceeded, or when only about one DB query's worth of time
+//     (LeaseTTL) is left before the deadline: DB read, return without caching
 //
 // dbRead must return the serialized data and its version number.
 func (ls *LockStack) Read(
@@ -31,7 +32,6 @@ func (ls *LockStack) Read(
 	}
 
 	ck := cacheKeyFor(key)
-	lk := lockKeyFor(key)
 
 	// Step 1 (M8): plain GET — if real data, serve immediately.
 	raw, err := ls.rdb.Get(ctx, ck).Result()
@@ -47,12 +47,12 @@ func (ls *LockStack) Read(
 
 	// Step 2: miss path — readCheck loop with lease grant + capped
 	// exponential backoff (0.5ms → 1 → 2 → 4ms cap, + jitter).
-	token := newLeaseToken()
+	lease := readerLeasePrefix + newLeaseToken()
 	start := time.Now()
 	backoff := ls.cfg.PollMin
 
 	for {
-		res, err := ls.readCheck(ctx, ck, lk, token)
+		res, err := ls.readCheck(ctx, ck, lease)
 		if err != nil {
 			log.Printf("lockstack: readCheck failed for %s: %v", ck, err)
 			return dbRead(ctx)
@@ -66,14 +66,17 @@ func (ls *LockStack) Read(
 			return dbRead(ctx)
 
 		case "GRANTED":
-			return ls.fetchAndFill(ctx, ck, token, dbRead)
+			return ls.fetchAndFill(ctx, ck, lease, dbRead)
 
 		case "LOCKED", "LEASED":
 			maxWait := ls.cfg.LeaseTTL
 			if res.state == "LOCKED" {
-				maxWait = 2 * ls.cfg.LockTTL
+				maxWait = ls.cfg.MaxLockedWait
 			}
-			if time.Since(start) > maxWait {
+			// Stop waiting at the max wait, or while there is still time for
+			// an uncached DB read before the request's deadline (LeaseTTL is
+			// sized as one DB query + margin).
+			if time.Since(start) > maxWait || timeLeft(ctx) < ls.cfg.LeaseTTL {
 				return dbRead(ctx)
 			}
 			select {
@@ -96,8 +99,8 @@ type readCheckResult struct {
 }
 
 // readCheck runs the readCheckCmd Lua script and parses the array result.
-func (ls *LockStack) readCheck(ctx context.Context, cacheKey, lockKey, token string) (readCheckResult, error) {
-	result, err := readCheckCmd.Run(ctx, ls.rdb, []string{cacheKey, lockKey}, token, ls.cfg.LeaseTTL.Milliseconds()).Slice()
+func (ls *LockStack) readCheck(ctx context.Context, cacheKey, lease string) (readCheckResult, error) {
+	result, err := readCheckCmd.Run(ctx, ls.rdb, []string{cacheKey}, lease, ls.cfg.LeaseTTL.Milliseconds()).Slice()
 	if err != nil {
 		return readCheckResult{}, err
 	}
@@ -113,17 +116,18 @@ func (ls *LockStack) readCheck(ctx context.Context, cacheKey, lockKey, token str
 }
 
 // fetchAndFill reads DB under a granted lease, then populates cache via
-// leaseSetCmd. If the lease was voided (writer DEL'd it), the populate is
-// silently dropped — data is still returned to the caller.
+// leaseSetCmd. If the lease was voided (a writer replaced it with its writer
+// lease), the populate is silently dropped — data is still returned to the
+// caller.
 func (ls *LockStack) fetchAndFill(
 	ctx context.Context,
 	cacheKey string,
-	token string,
+	lease string,
 	dbRead func(ctx context.Context) ([]byte, int64, error),
 ) ([]byte, int64, error) {
 	// Release the lease on any exit path. Safe to call after a successful
 	// leaseSet — the slot no longer holds our lease, so it's a no-op.
-	defer ls.releaseLease(cacheKey, token)
+	defer ls.releaseLease(cacheKey, lease)
 
 	data, version, err := dbRead(ctx)
 	if err != nil {
@@ -132,7 +136,7 @@ func (ls *LockStack) fetchAndFill(
 
 	encoded := encodeValue(version, data)
 	ttl := cacheTTLSeconds(ls.cfg.CacheTTL)
-	if setErr := leaseSetCmd.Run(ctx, ls.rdb, []string{cacheKey}, token, encoded, ttl).Err(); setErr != nil {
+	if setErr := leaseSetCmd.Run(ctx, ls.rdb, []string{cacheKey}, lease, encoded, ttl).Err(); setErr != nil {
 		log.Printf("lockstack: leaseSet failed for %s: %v", cacheKey, setErr)
 	}
 
@@ -142,8 +146,8 @@ func (ls *LockStack) fetchAndFill(
 // releaseLease deletes the lease only if it's still ours. Uses background
 // context because this runs in a defer after the request context may have
 // been cancelled.
-func (ls *LockStack) releaseLease(cacheKey, token string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+func (ls *LockStack) releaseLease(cacheKey, lease string) {
+	ctx, cancel := context.WithTimeout(context.Background(), ls.cfg.CleanupTimeout)
 	defer cancel()
-	_ = releaseLeaseCmd.Run(ctx, ls.rdb, []string{cacheKey}, token).Err()
+	_ = releaseLeaseCmd.Run(ctx, ls.rdb, []string{cacheKey}, lease).Err()
 }
